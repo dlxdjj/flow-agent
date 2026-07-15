@@ -1,0 +1,11 @@
+{
+  "session_id": "fixture-claude-session",
+  "transcript_path": "/redacted/transcript.jsonl",
+  "cwd": "/redacted/example-project",
+  "permission_mode": "default",
+  "hook_event_name": "TaskCompleted",
+  "task_id": "task-001",
+  "task_subject": "Implement user authentication",
+  "task_description": "Redacted task description",
+  "teammate_name": "implementer"
+}

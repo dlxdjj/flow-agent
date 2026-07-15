@@ -2,7 +2,10 @@
 mod unix;
 
 #[cfg(unix)]
-pub use unix::{default_socket_path, BridgeClient, BridgeError, BridgeListener};
+pub use unix::{
+    default_socket_path, unix_socket_path_limit, validate_socket_path, BridgeClient, BridgeError,
+    BridgeListener,
+};
 
 #[cfg(not(unix))]
 compile_error!(

@@ -14,6 +14,11 @@ const ui = {
   undoMessage: document.querySelector("#undo-message"),
   undoButton: document.querySelector("#undo-button"),
   toast: document.querySelector("#toast"),
+  setupTrigger: document.querySelector("#setup-trigger"),
+  setupOverlay: document.querySelector("#setup-overlay"),
+  setupClose: document.querySelector("#setup-close"),
+  setupProviders: document.querySelector("#setup-providers"),
+  setupRefresh: document.querySelector("#setup-refresh"),
 };
 
 let csrfToken = sessionStorage.getItem("flowAgentCsrf");
@@ -23,6 +28,8 @@ let socket;
 let reconnectDelay = 500;
 let undoCommandId;
 let toastTimer;
+let setupState = { providers: [], firstRun: false };
+let setupBusy = false;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -67,6 +74,109 @@ function outcomeSummary() {
 
 function providerName(provider) {
   return { claude: "Claude", codex: "Codex", gemini: "Gemini" }[provider] || provider || "Agent";
+}
+
+function setupStatus(status) {
+  return {
+    not_installed: { label: "未接入", className: "muted", detail: "不会修改现有配置，点击后先备份再语义合并。" },
+    cli_missing: { label: "未找到 CLI", className: "error", detail: "请先安装这个 Agent 的命令行程序。" },
+    needs_trust: { label: "等待信任", className: "warning", detail: "打开 Codex，输入 /hooks，逐项检查并信任 Flow Agent。" },
+    installed_unverified: { label: "等待验证", className: "warning", detail: "配置已经就绪。启动一次真实会话后才能确认接入。" },
+    connected: { label: "已接入", className: "ready", detail: "已收到安装后的真实 Agent 事件，实时活动可以正常显示。" },
+    needs_reinstall: { label: "配置有变化", className: "error", detail: "发现不完整或被修改的 Flow Agent 条目；不会自动覆盖。" },
+    inline_conflict: { label: "配置冲突", className: "error", detail: "Codex 同时存在 inline Hook。请先保留一种同层配置形式。" },
+    error: { label: "配置无法解析", className: "error", detail: "为保护你的设置，Flow Agent 已拒绝改写。请先恢复或修正配置。" },
+  }[status] || { label: status, className: "muted", detail: "状态暂时无法识别。" };
+}
+
+function setupButton(label, className, handler, disabled = false) {
+  const button = element("button", `setup-action ${className || ""}`.trim(), label);
+  button.type = "button";
+  button.disabled = disabled || setupBusy;
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function renderSetup() {
+  ui.setupProviders.replaceChildren();
+  for (const provider of setupState.providers || []) {
+    const status = setupStatus(provider.status);
+    const card = element("article", "setup-provider");
+    const heading = element("div", "setup-provider-heading");
+    const identity = element("div", "setup-identity");
+    identity.append(element("span", "provider-glyph", providerName(provider.provider).slice(0, 2)));
+    identity.append(element("strong", "", providerName(provider.provider)));
+    heading.append(identity, element("span", `setup-status ${status.className}`, status.label));
+    card.append(heading, element("p", "setup-detail", status.detail));
+
+    if (provider.provider === "codex" && provider.status === "needs_trust") {
+      const steps = element("ol", "trust-steps");
+      for (const step of ["打开任意 Codex 会话", "输入 /hooks", "核对命令路径后选择信任", "启动一个新会话并回到这里刷新"]) {
+        steps.append(element("li", "", step));
+      }
+      card.append(steps);
+    }
+    const path = element("div", "setup-path", provider.configPath || "");
+    path.title = provider.configPath || "";
+    card.append(path);
+    const actions = element("div", "setup-actions");
+    if (provider.status === "not_installed") {
+      actions.append(setupButton("安全接入", "primary", () => changeSetup(provider.provider, "install")));
+    } else if (provider.status === "needs_reinstall") {
+      actions.append(setupButton("检查后重新安装", "primary", () => changeSetup(provider.provider, "install")));
+    } else if (provider.canRepair) {
+      actions.append(setupButton("修复二进制", "primary", () => changeSetup(provider.provider, "repair")));
+    } else if (["needs_trust", "installed_unverified", "connected"].includes(provider.status)) {
+      actions.append(setupButton("刷新状态", "primary", loadSetup));
+      actions.append(setupButton("移除接入", "ghost", () => changeSetup(provider.provider, "uninstall")));
+    } else {
+      actions.append(setupButton("暂不可操作", "ghost", () => {}, true));
+    }
+    card.append(actions);
+    ui.setupProviders.append(card);
+  }
+  const needsAttention = (setupState.providers || []).some((provider) => provider.status !== "connected");
+  ui.setupTrigger.classList.toggle("needs-attention", needsAttention);
+}
+
+function openSetup() {
+  ui.setupOverlay.hidden = false;
+  ui.setupClose.focus();
+}
+
+function closeSetup() {
+  ui.setupOverlay.hidden = true;
+  sessionStorage.setItem("flowAgentSetupSeen", "1");
+  ui.setupTrigger.focus();
+}
+
+async function loadSetup() {
+  try {
+    setupState = await api("/api/v1/setup");
+    renderSetup();
+    if (setupState.firstRun && !sessionStorage.getItem("flowAgentSetupSeen")) openSetup();
+  } catch (error) {
+    showToast(`接入状态读取失败：${error.message}`);
+  }
+}
+
+async function changeSetup(provider, action) {
+  if (setupBusy) return;
+  setupBusy = true;
+  renderSetup();
+  try {
+    setupState = await api("/api/v1/setup", {
+      method: "POST",
+      body: JSON.stringify({ provider, action, enhancedCodexActivity: false }),
+    });
+    renderSetup();
+    showToast(action === "uninstall" ? `${providerName(provider)} 接入已移除` : `${providerName(provider)} 配置已安全写入`);
+  } catch (error) {
+    showToast(`接入操作失败：${error.detail || error.message}`);
+  } finally {
+    setupBusy = false;
+    renderSetup();
+  }
 }
 
 function stateLabel(state) {
@@ -208,6 +318,20 @@ function renderSessions() {
     title.append(element("strong", "", session.project || providerName(session.provider)));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
     copy.append(title, element("div", "row-subtitle", session.activity || stateLabel(session.execState)));
+    if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
+      const progress = element("div", "plan-progress");
+      const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
+      const track = element("div", "plan-track");
+      track.setAttribute("role", "progressbar");
+      track.setAttribute("aria-valuemin", "0");
+      track.setAttribute("aria-valuemax", String(session.planTotal));
+      track.setAttribute("aria-valuenow", String(session.planDone));
+      const fill = element("div", "plan-fill");
+      fill.style.width = `${Math.max(0, Math.min(100, session.planDone / session.planTotal * 100))}%`;
+      track.append(fill);
+      progress.append(label, track);
+      copy.append(progress);
+    }
     top.append(copy);
     row.append(top);
     ui.sessionList.append(row);
@@ -253,7 +377,11 @@ async function api(path, options = {}) {
   if (csrfToken && options.method && options.method !== "GET") headers.set("x-flow-agent-csrf", csrfToken);
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error?.code || `HTTP_${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error?.code || `HTTP_${response.status}`);
+    error.detail = data.error?.detail;
+    throw error;
+  }
   return data;
 }
 
@@ -294,7 +422,11 @@ function connectSocket() {
   socket.addEventListener("message", (event) => {
     try {
       const frame = JSON.parse(event.data);
-      if (frame.type === "snapshot") render(frame.snapshot);
+      if (frame.type === "snapshot") {
+        const previousEventCount = Number(snapshot.stats?.eventCount || 0);
+        render(frame.snapshot);
+        if (Number(snapshot.stats?.eventCount || 0) !== previousEventCount) loadSetup();
+      }
     } catch (_) {
       showToast("Runtime 返回了无法识别的消息");
     }
@@ -355,11 +487,21 @@ function showToast(message) {
 ui.undoButton.addEventListener("click", () => {
   if (undoCommandId) undoCommand(undoCommandId);
 });
+ui.setupTrigger.addEventListener("click", openSetup);
+ui.setupClose.addEventListener("click", closeSetup);
+ui.setupRefresh.addEventListener("click", loadSetup);
+ui.setupOverlay.addEventListener("click", (event) => {
+  if (event.target === ui.setupOverlay) closeSetup();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !ui.setupOverlay.hidden) closeSetup();
+});
 
 (async () => {
   setConnected(false);
   try {
     await loadSnapshot();
+    await loadSetup();
     connectSocket();
   } catch (error) {
     ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 flow-agent serve 输出的一次性地址打开控制面板。"));

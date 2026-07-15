@@ -3,6 +3,7 @@ members = [
     "crates/app",
     "crates/bridge",
     "crates/core",
+    "crates/installer",
     "crates/providers",
     "crates/runtime",
     "crates/server",
@@ -25,4 +26,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.52.3", features = ["net", "rt", "sync", "time"] }
+toml_edit = "0.22"
 uuid = { version = "1.18", features = ["v7", "serde"] }

@@ -2,12 +2,11 @@ use flow_agent_core::{BridgeRequest, BridgeResponse, ReplyAction};
 use std::env;
 use std::fs::{self, DirBuilder};
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
@@ -27,6 +26,12 @@ pub enum BridgeError {
     RuntimeChanged,
     #[error("bridge response deadline exceeded")]
     DeadlineExceeded,
+    #[error("Unix socket path is {actual} bytes; maximum supported length is {maximum}: {path}")]
+    SocketPathTooLong {
+        path: PathBuf,
+        actual: usize,
+        maximum: usize,
+    },
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -37,6 +42,26 @@ pub fn default_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".flow-agent/run/bridge.sock")
+}
+
+pub fn unix_socket_path_limit() -> usize {
+    // SAFETY: sockaddr_un is a plain C data structure. A zeroed value is valid
+    // for measuring the fixed sun_path array and is never passed to the OS.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len().saturating_sub(1)
+}
+
+pub fn validate_socket_path(path: &Path) -> Result<(), BridgeError> {
+    let actual = path.as_os_str().as_bytes().len();
+    let maximum = unix_socket_path_limit();
+    if actual > maximum {
+        return Err(BridgeError::SocketPathTooLong {
+            path: path.to_path_buf(),
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 pub struct BridgeClient {
@@ -55,6 +80,7 @@ impl BridgeClient {
         request: &BridgeRequest,
         timeout: Duration,
     ) -> Result<Option<BridgeResponse>, BridgeError> {
+        validate_socket_path(&self.socket_path)?;
         let mut stream = UnixStream::connect(&self.socket_path)?;
         stream.set_write_timeout(Some(Duration::from_millis(200)))?;
         serde_json::to_writer(&mut stream, request)?;
@@ -135,6 +161,7 @@ pub struct BridgeListener {
 impl BridgeListener {
     pub fn bind(socket_path: impl Into<PathBuf>) -> Result<Self, BridgeError> {
         let socket_path = socket_path.into();
+        validate_socket_path(&socket_path)?;
         if let Some(parent) = socket_path.parent() {
             let created_parent = !parent.exists();
             if created_parent {

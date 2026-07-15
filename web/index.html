@@ -13,9 +13,12 @@
         <span class="brand-mark" aria-hidden="true">F</span>
         <span>Flow Agent</span>
       </div>
-      <div class="runtime-state" id="runtime-state" role="status">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="runtime-label">正在连接本地 Runtime</span>
+      <div class="top-actions">
+        <button class="setup-trigger" id="setup-trigger" type="button">接入设置</button>
+        <div class="runtime-state" id="runtime-state" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="runtime-label">正在连接本地 Runtime</span>
+        </div>
       </div>
     </header>
 
@@ -60,6 +63,29 @@
         </footer>
       </section>
     </main>
+
+    <div class="setup-overlay" id="setup-overlay" hidden>
+      <section class="setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+        <header class="setup-header">
+          <div>
+            <p class="eyebrow">FIRST RUN</p>
+            <h2 id="setup-title">接入你的 Agent</h2>
+            <p>Flow Agent 只接管官方授权请求；Runtime 不在线时会静默交回原终端。</p>
+          </div>
+          <button class="setup-close" id="setup-close" type="button" aria-label="关闭接入设置">×</button>
+        </header>
+        <div class="setup-safety">
+          <span>修改前自动备份</span>
+          <span>保留已有 Hook</span>
+          <span>不会绕过 Codex 信任</span>
+        </div>
+        <div class="setup-providers" id="setup-providers" aria-live="polite"></div>
+        <footer class="setup-footer">
+          <span>安装后启动一次真实会话，状态才会变为“已接入”。</span>
+          <button id="setup-refresh" type="button">刷新状态</button>
+        </footer>
+      </section>
+    </div>
 
     <div class="undo-toast" id="undo-toast" role="status" hidden>
       <span id="undo-message">决定将在 3 秒后提交</span>

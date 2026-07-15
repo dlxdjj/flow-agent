@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use flow_agent_bridge::{default_socket_path, BridgeClient, BridgeListener};
+use flow_agent_bridge::{default_socket_path, validate_socket_path, BridgeClient, BridgeListener};
 use flow_agent_core::{
     permission_deadline_ms, permission_directive, BridgeRequest, Decision, Provider,
-    MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
+    DOCTOR_PROBE_EVENT, MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
+};
+use flow_agent_installer::{
+    BinaryHealth, CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
+    InstallOptions, InstallPaths, Installer,
 };
 use flow_agent_runtime::{
     default_database_path, ApprovalAction, EventSpool, RuntimeInstanceGuard, RuntimeStore,
     WaiterRegistry,
 };
 use flow_agent_server::{ApiServer, ApiServerConfig};
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -49,6 +57,28 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Safely install Claude and/or Codex hooks into user configuration.
+    InstallHooks {
+        #[arg(value_enum, default_value_t = HookTarget::All)]
+        provider: HookTarget,
+        /// Also observe Codex tool start/finish events (off by default).
+        #[arg(long)]
+        enhanced_codex_activity: bool,
+        /// Repair only an intact installation; never recreate manually removed hooks.
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Remove only Flow Agent hook entries and preserve all user configuration.
+    UninstallHooks {
+        #[arg(value_enum, default_value_t = HookTarget::All)]
+        provider: HookTarget,
+    },
+    /// Diagnose provider CLIs, hook configuration, trust, runtime, and fail-open behavior.
+    Doctor {
+        /// Emit a stable machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -58,6 +88,23 @@ enum ApprovalMode {
     Allow,
     Deny,
     PassThrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HookTarget {
+    Claude,
+    Codex,
+    All,
+}
+
+impl HookTarget {
+    fn providers(self) -> &'static [HookProvider] {
+        match self {
+            Self::Claude => &[HookProvider::Claude],
+            Self::Codex => &[HookProvider::Codex],
+            Self::All => &[HookProvider::Claude, HookProvider::Codex],
+        }
+    }
 }
 
 enum RuntimeOutcome {
@@ -87,10 +134,827 @@ fn main() -> Result<()> {
             let _ = run_hook(provider, socket.unwrap_or_else(default_socket_path));
             Ok(())
         }
+        Command::InstallHooks {
+            provider,
+            enhanced_codex_activity,
+            repair,
+        } => install_hooks(provider, enhanced_codex_activity, repair),
+        Command::UninstallHooks { provider } => uninstall_hooks(provider),
+        Command::Doctor { json } => doctor(json),
     }
 }
 
+fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool) -> Result<()> {
+    validate_socket_path(&default_socket_path()).context("invalid Flow Agent socket path")?;
+    for provider in target.providers() {
+        ensure_provider_cli(*provider)?;
+    }
+    let paths = InstallPaths::discover()?;
+    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let installer = Installer::new(paths, source_binary);
+    let options = InstallOptions {
+        enhanced_codex_activity,
+    };
+    for provider in target.providers() {
+        if repair {
+            let report = installer.repair(*provider, options)?;
+            if report.attempted {
+                println!("repaired {} hooks", provider.as_str());
+            } else {
+                println!(
+                    "left {} hooks unchanged: {}",
+                    provider.as_str(),
+                    report
+                        .skipped_reason
+                        .as_deref()
+                        .unwrap_or("repair not needed")
+                );
+            }
+            continue;
+        }
+        let report = installer.install(*provider, options)?;
+        println!(
+            "installed {} hooks in {}{}",
+            provider.as_str(),
+            report.config_path.display(),
+            report
+                .backup_path
+                .as_ref()
+                .map(|path| format!(" (backup: {})", path.display()))
+                .unwrap_or_default()
+        );
+        if *provider == HookProvider::Codex {
+            println!("Codex requires one manual trust step: open Codex, run /hooks, review and trust each Flow Agent command hook.");
+        }
+    }
+    Ok(())
+}
+
+fn uninstall_hooks(target: HookTarget) -> Result<()> {
+    let paths = InstallPaths::discover()?;
+    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let installer = Installer::new(paths, source_binary);
+    for provider in target.providers() {
+        let report = installer.uninstall(*provider)?;
+        println!(
+            "uninstalled {} hooks from {}{}",
+            provider.as_str(),
+            report.config_path.display(),
+            report
+                .backup_path
+                .as_ref()
+                .map(|path| format!(" (backup: {})", path.display()))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticStatus {
+    Pass,
+    Warning,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Repairability {
+    NotApplicable,
+    Automatic,
+    Manual,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticCheck {
+    id: String,
+    status: DiagnosticStatus,
+    summary: String,
+    detail: String,
+    repairability: Repairability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorReport {
+    schema_version: u16,
+    generated_at_ms: u64,
+    overall: DiagnosticStatus,
+    checks: Vec<DiagnosticCheck>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderVerification {
+    provider: HookProvider,
+    intent: InstallIntent,
+    definition_changed_at_ms: Option<u64>,
+}
+
+fn doctor(json: bool) -> Result<()> {
+    let paths = InstallPaths::discover()?;
+    let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
+    let installer = Installer::new(paths.clone(), source_binary);
+    let socket_path = default_socket_path();
+    let mut checks = Vec::new();
+
+    let socket_valid = match validate_socket_path(&socket_path) {
+        Ok(()) => {
+            checks.push(diagnostic(
+                "socket.path",
+                DiagnosticStatus::Pass,
+                "Unix socket path fits the operating-system limit",
+                socket_path.display().to_string(),
+                Repairability::NotApplicable,
+                None,
+            ));
+            true
+        }
+        Err(error) => {
+            checks.push(diagnostic(
+                "socket.path",
+                DiagnosticStatus::Fail,
+                "Unix socket path is too long",
+                error.to_string(),
+                Repairability::Manual,
+                Some("Set FLOW_AGENT_HOME to a shorter absolute path"),
+            ));
+            false
+        }
+    };
+
+    for provider in [HookProvider::Claude, HookProvider::Codex] {
+        add_cli_check(&mut checks, provider);
+    }
+
+    let mut installed_any = false;
+    let mut provider_verifications = Vec::new();
+    for provider in [HookProvider::Claude, HookProvider::Codex] {
+        match installer.inspect(provider) {
+            Ok(inspection) => {
+                installed_any |= inspection.intent == InstallIntent::Installed;
+                provider_verifications.push(ProviderVerification {
+                    provider,
+                    intent: inspection.intent,
+                    definition_changed_at_ms: inspection.installed_definition_changed_at_ms,
+                });
+                add_provider_checks(&mut checks, &inspection);
+            }
+            Err(error) => checks.push(diagnostic(
+                &format!("{}.inspection", provider.as_str()),
+                DiagnosticStatus::Fail,
+                &format!("Could not inspect {} integration", provider.as_str()),
+                error.to_string(),
+                Repairability::Manual,
+                Some("Restore the reported state/configuration file from backup"),
+            )),
+        }
+    }
+
+    add_runtime_checks(
+        &mut checks,
+        &socket_path,
+        socket_valid,
+        installed_any,
+        &provider_verifications,
+    );
+    add_pass_through_check(&mut checks, &paths, socket_valid);
+
+    let overall = if checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Fail)
+    {
+        DiagnosticStatus::Fail
+    } else if checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Warning)
+    {
+        DiagnosticStatus::Warning
+    } else {
+        DiagnosticStatus::Pass
+    };
+    let report = DoctorReport {
+        schema_version: 1,
+        generated_at_ms: now_millis(),
+        overall,
+        checks,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_doctor_report(&report);
+    }
+    Ok(())
+}
+
+fn diagnostic(
+    id: &str,
+    status: DiagnosticStatus,
+    summary: &str,
+    detail: String,
+    repairability: Repairability,
+    action: Option<&str>,
+) -> DiagnosticCheck {
+    DiagnosticCheck {
+        id: id.to_owned(),
+        status,
+        summary: summary.to_owned(),
+        detail,
+        repairability,
+        action: action.map(ToOwned::to_owned),
+    }
+}
+
+fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
+    let id = format!("{}.cli", provider.as_str());
+    let Some(executable) = find_provider_cli(provider) else {
+        checks.push(diagnostic(
+            &id,
+            DiagnosticStatus::Fail,
+            &format!("{} CLI is not installed", provider.as_str()),
+            "No executable was found in PATH".to_owned(),
+            Repairability::Manual,
+            Some("Install the provider CLI, then run flow-agent doctor again"),
+        ));
+        return;
+    };
+    let version_child = std::process::Command::new(&executable)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    match version_child.and_then(|child| wait_child_with_timeout(child, Duration::from_secs(2))) {
+        Ok((_, true)) => checks.push(diagnostic(
+            &id,
+            DiagnosticStatus::Warning,
+            &format!("{} CLI version check timed out", provider.as_str()),
+            format!(
+                "{} exceeded 2 seconds and was stopped",
+                executable.display()
+            ),
+            Repairability::Manual,
+            Some("Run the provider CLI --version command directly"),
+        )),
+        Ok((output, false)) if output.status.success() => {
+            let version = first_bounded_line(&output.stdout)
+                .or_else(|| first_bounded_line(&output.stderr))
+                .unwrap_or_else(|| "version command succeeded without text".to_owned());
+            checks.push(diagnostic(
+                &id,
+                DiagnosticStatus::Pass,
+                &format!("{} CLI is available", provider.as_str()),
+                format!("{} · {version}", executable.display()),
+                Repairability::NotApplicable,
+                None,
+            ));
+        }
+        Ok((output, false)) => checks.push(diagnostic(
+            &id,
+            DiagnosticStatus::Warning,
+            &format!("{} CLI version check failed", provider.as_str()),
+            format!("{} exited with {}", executable.display(), output.status),
+            Repairability::Manual,
+            Some("Run the provider CLI --version command directly"),
+        )),
+        Err(error) => checks.push(diagnostic(
+            &id,
+            DiagnosticStatus::Warning,
+            &format!("{} CLI could not be started", provider.as_str()),
+            error.to_string(),
+            Repairability::Manual,
+            Some("Check executable permissions and PATH"),
+        )),
+    }
+}
+
+fn add_provider_checks(
+    checks: &mut Vec<DiagnosticCheck>,
+    inspection: &flow_agent_installer::ProviderInspection,
+) {
+    let provider = inspection.provider.as_str();
+    match inspection.config_health {
+        ConfigHealth::Malformed => checks.push(diagnostic(
+            &format!("{provider}.config"),
+            DiagnosticStatus::Fail,
+            &format!("{provider} configuration is malformed"),
+            format!(
+                "{} · {}",
+                inspection.config_path.display(),
+                inspection.config_error.as_deref().unwrap_or("parse failed")
+            ),
+            Repairability::Manual,
+            Some("Fix or restore the provider configuration; doctor will not rewrite it"),
+        )),
+        ConfigHealth::Missing if inspection.intent == InstallIntent::Installed => {
+            checks.push(diagnostic(
+                &format!("{provider}.config"),
+                DiagnosticStatus::Fail,
+                &format!("{provider} hooks were removed after installation"),
+                inspection.config_path.display().to_string(),
+                Repairability::Manual,
+                Some("Run install-hooks explicitly if you want to reconnect; repair will not recreate manually removed hooks"),
+            ));
+        }
+        ConfigHealth::Missing => checks.push(diagnostic(
+            &format!("{provider}.config"),
+            DiagnosticStatus::Warning,
+            &format!("{provider} is not connected"),
+            format!("{} is missing", inspection.config_path.display()),
+            Repairability::Manual,
+            Some(&format!("Run flow-agent install-hooks {provider}")),
+        )),
+        ConfigHealth::Valid if inspection.definition_matches_manifest => checks.push(diagnostic(
+            &format!("{provider}.config"),
+            DiagnosticStatus::Pass,
+            &format!("{provider} Flow Agent hooks match the installation manifest"),
+            format!(
+                "{} managed handlers in {}",
+                inspection.owned_handlers,
+                inspection.config_path.display()
+            ),
+            Repairability::NotApplicable,
+            None,
+        )),
+        ConfigHealth::Valid if inspection.owned_handlers > 0 => checks.push(diagnostic(
+            &format!("{provider}.config"),
+            DiagnosticStatus::Fail,
+            &format!("{provider} Flow Agent hooks are incomplete or changed"),
+            format!(
+                "found {} managed handlers; expected {}",
+                inspection.owned_handlers, inspection.expected_handlers
+            ),
+            Repairability::Manual,
+            Some(&format!(
+                "Review the configuration, then explicitly run flow-agent install-hooks {provider}"
+            )),
+        )),
+        ConfigHealth::Valid => checks.push(diagnostic(
+            &format!("{provider}.config"),
+            DiagnosticStatus::Warning,
+            &format!("{provider} has no Flow Agent hooks"),
+            inspection.config_path.display().to_string(),
+            Repairability::Manual,
+            Some(&format!("Run flow-agent install-hooks {provider}")),
+        )),
+    }
+
+    match inspection.binary_health {
+        BinaryHealth::Executable => checks.push(diagnostic(
+            &format!("{provider}.binary"),
+            DiagnosticStatus::Pass,
+            "Stable hook binary is executable",
+            inspection.binary_path.display().to_string(),
+            Repairability::NotApplicable,
+            None,
+        )),
+        BinaryHealth::Missing if inspection.intent != InstallIntent::Installed => {
+            checks.push(diagnostic(
+                &format!("{provider}.binary"),
+                DiagnosticStatus::Warning,
+                "Stable hook binary is not installed",
+                inspection.binary_path.display().to_string(),
+                Repairability::Manual,
+                Some(&format!("Run flow-agent install-hooks {provider}")),
+            ));
+        }
+        health => checks.push(diagnostic(
+            &format!("{provider}.binary"),
+            DiagnosticStatus::Fail,
+            "Stable hook binary is unavailable or unsafe",
+            format!("{} · {health:?}", inspection.binary_path.display()),
+            if inspection.definition_matches_manifest {
+                Repairability::Automatic
+            } else {
+                Repairability::Manual
+            },
+            Some(if inspection.definition_matches_manifest {
+                "Run install-hooks --repair for this provider"
+            } else {
+                "Review the hook configuration before explicitly reinstalling"
+            }),
+        )),
+    }
+
+    if inspection.provider == HookProvider::Codex {
+        add_codex_checks(checks, inspection);
+    }
+}
+
+fn add_codex_checks(
+    checks: &mut Vec<DiagnosticCheck>,
+    inspection: &flow_agent_installer::ProviderInspection,
+) {
+    if let Some(error) = inspection.codex_config_error.as_deref() {
+        checks.push(diagnostic(
+            "codex.config_toml",
+            DiagnosticStatus::Fail,
+            "Codex config.toml is malformed",
+            error.to_owned(),
+            Repairability::Manual,
+            Some("Fix or restore config.toml; Flow Agent will not rewrite malformed TOML"),
+        ));
+        return;
+    }
+    if !inspection.codex_inline_events.is_empty() {
+        checks.push(diagnostic(
+            "codex.inline_hooks",
+            DiagnosticStatus::Fail,
+            "Codex has same-layer inline hook definitions",
+            inspection.codex_inline_events.join(", "),
+            Repairability::Manual,
+            Some("Keep either inline [hooks] or hooks.json at this layer to avoid duplicate execution"),
+        ));
+    }
+    match inspection.codex_feature_status {
+        Some(CodexFeatureStatus::EnabledByDefault) | Some(CodexFeatureStatus::EnabledCanonical) => {
+            checks.push(diagnostic(
+                "codex.feature",
+                DiagnosticStatus::Pass,
+                "Codex Hooks are enabled",
+                format!("{:?}", inspection.codex_feature_status.unwrap()),
+                Repairability::NotApplicable,
+                None,
+            ))
+        }
+        Some(CodexFeatureStatus::EnabledLegacy) => checks.push(diagnostic(
+            "codex.feature",
+            DiagnosticStatus::Warning,
+            "Codex Hooks use the legacy codex_hooks feature alias",
+            "The alias is recognized but new configuration uses hooks".to_owned(),
+            Repairability::Manual,
+            Some("Migrate [features].codex_hooks to [features].hooks when convenient"),
+        )),
+        Some(CodexFeatureStatus::DisabledCanonical) | Some(CodexFeatureStatus::DisabledLegacy) => {
+            checks.push(diagnostic(
+                "codex.feature",
+                DiagnosticStatus::Fail,
+                "Codex Hooks are disabled",
+                format!("{:?}", inspection.codex_feature_status.unwrap()),
+                Repairability::Manual,
+                Some("Enable [features].hooks in Codex config.toml"),
+            ))
+        }
+        Some(CodexFeatureStatus::ConflictingFlags) => checks.push(diagnostic(
+            "codex.feature",
+            DiagnosticStatus::Fail,
+            "Codex has conflicting canonical and legacy Hook flags",
+            "Both hooks and codex_hooks are present".to_owned(),
+            Repairability::Manual,
+            Some("Keep the canonical [features].hooks value and remove the legacy alias"),
+        )),
+        Some(CodexFeatureStatus::ConfigMalformed) | None => {}
+    }
+    match inspection.codex_trust_status {
+        Some(CodexTrustStatus::TrustedStatePresent) => checks.push(diagnostic(
+            "codex.trust",
+            DiagnosticStatus::Pass,
+            "Codex trust state covers every Flow Agent hook",
+            "Exact hook locations are enabled with trusted hashes newer than the installed definition".to_owned(),
+            Repairability::NotApplicable,
+            None,
+        )),
+        Some(CodexTrustStatus::ReviewRequired) => checks.push(diagnostic(
+            "codex.trust",
+            DiagnosticStatus::Warning,
+            "Codex Hook review is still required",
+            "Flow Agent never writes Codex trust state or bypasses its security review".to_owned(),
+            Repairability::Manual,
+            Some("Open Codex, run /hooks, review each Flow Agent command, then trust and trigger a new session"),
+        )),
+        Some(CodexTrustStatus::NotInstalled) => checks.push(diagnostic(
+            "codex.trust",
+            DiagnosticStatus::Warning,
+            "Codex trust is not applicable until hooks are installed",
+            "No Flow Agent Codex hook was found".to_owned(),
+            Repairability::Manual,
+            Some("Run flow-agent install-hooks codex"),
+        )),
+        Some(CodexTrustStatus::ConfigMalformed) | None => {}
+    }
+}
+
+fn add_runtime_checks(
+    checks: &mut Vec<DiagnosticCheck>,
+    socket_path: &std::path::Path,
+    socket_valid: bool,
+    installed_any: bool,
+    provider_verifications: &[ProviderVerification],
+) {
+    if !socket_valid {
+        checks.push(diagnostic(
+            "runtime.control_loop",
+            DiagnosticStatus::Fail,
+            "Runtime probe skipped because the socket path is invalid",
+            socket_path.display().to_string(),
+            Repairability::Manual,
+            Some("Shorten FLOW_AGENT_HOME first"),
+        ));
+        add_real_event_checks(checks, provider_verifications, None);
+        return;
+    }
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                checks.push(diagnostic(
+                    "runtime.socket_permissions",
+                    DiagnosticStatus::Fail,
+                    "Runtime socket permissions are unsafe",
+                    format!("{} has mode {mode:o}", socket_path.display()),
+                    Repairability::Automatic,
+                    Some("Stop and restart Flow Agent Runtime"),
+                ));
+            } else {
+                checks.push(diagnostic(
+                    "runtime.socket_permissions",
+                    DiagnosticStatus::Pass,
+                    "Runtime socket is private to the current user",
+                    socket_path.display().to_string(),
+                    Repairability::NotApplicable,
+                    None,
+                ));
+            }
+        }
+        Ok(_) => checks.push(diagnostic(
+            "runtime.socket_permissions",
+            DiagnosticStatus::Fail,
+            "Runtime path exists but is not a Unix socket",
+            socket_path.display().to_string(),
+            Repairability::Manual,
+            Some("Inspect the path before removing it, then restart Flow Agent Runtime"),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => checks.push(diagnostic(
+            "runtime.socket_permissions",
+            if installed_any {
+                DiagnosticStatus::Fail
+            } else {
+                DiagnosticStatus::Warning
+            },
+            "Flow Agent Runtime is not running",
+            socket_path.display().to_string(),
+            Repairability::Automatic,
+            Some("Start flow-agent serve --approval widget"),
+        )),
+        Err(error) => checks.push(diagnostic(
+            "runtime.socket_permissions",
+            DiagnosticStatus::Fail,
+            "Runtime socket could not be inspected",
+            error.to_string(),
+            Repairability::Manual,
+            Some("Check the Flow Agent home directory permissions"),
+        )),
+    }
+
+    let probe = BridgeRequest::doctor_probe_at(now_millis());
+    let mut probe_summary = None;
+    match BridgeClient::new(socket_path.to_path_buf()).send(&probe, Duration::from_secs(1)) {
+        Ok(Some(response)) if response.reason.as_deref() == Some("doctor_probe_ok") => {
+            probe_summary = response
+                .message
+                .as_deref()
+                .and_then(|message| serde_json::from_str::<Value>(message).ok());
+            checks.push(diagnostic(
+                "runtime.control_loop",
+                DiagnosticStatus::Pass,
+                "Runtime control round trip succeeded",
+                "The diagnostic frame was acknowledged without creating an Agent session"
+                    .to_owned(),
+                Repairability::NotApplicable,
+                None,
+            ));
+        }
+        Ok(_) => checks.push(diagnostic(
+            "runtime.control_loop",
+            DiagnosticStatus::Fail,
+            "Runtime returned an unexpected diagnostic response",
+            "The bridge connected but did not acknowledge the probe".to_owned(),
+            Repairability::Automatic,
+            Some("Restart Flow Agent Runtime and rerun doctor"),
+        )),
+        Err(error) => checks.push(diagnostic(
+            "runtime.control_loop",
+            if installed_any {
+                DiagnosticStatus::Fail
+            } else {
+                DiagnosticStatus::Warning
+            },
+            "Runtime control round trip is unavailable",
+            error.to_string(),
+            Repairability::Automatic,
+            Some("Start or restart flow-agent serve --approval widget"),
+        )),
+    }
+    add_real_event_checks(checks, provider_verifications, probe_summary.as_ref());
+}
+
+fn add_real_event_checks(
+    checks: &mut Vec<DiagnosticCheck>,
+    providers: &[ProviderVerification],
+    probe_summary: Option<&Value>,
+) {
+    for verification in providers
+        .iter()
+        .filter(|verification| verification.intent == InstallIntent::Installed)
+    {
+        let provider = verification.provider.as_str();
+        let latest = probe_summary
+            .and_then(|summary| summary.pointer(&format!("/latestProviderEventAt/{provider}")))
+            .and_then(Value::as_u64);
+        let verified = verification
+            .definition_changed_at_ms
+            .zip(latest)
+            .is_some_and(|(installed_at, event_at)| event_at >= installed_at);
+        if verified {
+            checks.push(diagnostic(
+                &format!("{provider}.real_event"),
+                DiagnosticStatus::Pass,
+                &format!("{provider} emitted a real event after installation"),
+                format!("latest event at {}", latest.unwrap_or_default()),
+                Repairability::NotApplicable,
+                None,
+            ));
+        } else {
+            checks.push(diagnostic(
+                &format!("{provider}.real_event"),
+                DiagnosticStatus::Warning,
+                &format!("{provider} installation is not yet verified by a real event"),
+                "A diagnostic bridge probe is not counted as provider evidence".to_owned(),
+                Repairability::Manual,
+                Some(&format!(
+                    "Start a new {provider} session, then run flow-agent doctor again"
+                )),
+            ));
+        }
+    }
+}
+
+fn add_pass_through_check(
+    checks: &mut Vec<DiagnosticCheck>,
+    paths: &InstallPaths,
+    socket_valid: bool,
+) {
+    let stable_binary = paths.stable_binary();
+    if !socket_valid || !stable_binary.exists() {
+        checks.push(diagnostic(
+            "hook.pass_through",
+            DiagnosticStatus::Warning,
+            "Fail-open pass-through probe was skipped",
+            if !socket_valid {
+                "socket path is invalid".to_owned()
+            } else {
+                format!("{} is missing", stable_binary.display())
+            },
+            Repairability::Manual,
+            Some("Install hooks after fixing earlier diagnostics"),
+        ));
+        return;
+    }
+    let missing_socket = paths
+        .flow_home
+        .join(format!("run/doctor-missing-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&missing_socket);
+    let mut child = match std::process::Command::new(&stable_binary)
+        .args(["hook", "--provider", "claude", "--socket"])
+        .arg(&missing_socket)
+        .env("FLOW_AGENT_HOME", &paths.flow_home)
+        .env("FLOW_AGENT_STDIN_TIMEOUT_MS", "500")
+        .env("FLOW_AGENT_HOOK_REPLY_TIMEOUT_MS", "100")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            checks.push(diagnostic(
+                "hook.pass_through",
+                DiagnosticStatus::Fail,
+                "Fail-open pass-through probe could not start",
+                error.to_string(),
+                Repairability::Automatic,
+                Some("Repair the stable hook binary"),
+            ));
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(
+            br#"{"hook_event_name":"PermissionRequest","session_id":"flow-agent-doctor","tool_name":"Bash","tool_input":{"command":"true"}}"#,
+        );
+    }
+    match wait_child_with_timeout(child, Duration::from_secs(2)) {
+        Ok((_, true)) => checks.push(diagnostic(
+            "hook.pass_through",
+            DiagnosticStatus::Fail,
+            "Runtime-offline pass-through exceeded its safety deadline",
+            "The probe was stopped after 2 seconds".to_owned(),
+            Repairability::Automatic,
+            Some("Repair or reinstall the stable hook binary"),
+        )),
+        Ok((output, false)) if output.status.success() && output.stdout.is_empty() => {
+            checks.push(diagnostic(
+                "hook.pass_through",
+                DiagnosticStatus::Pass,
+                "Runtime-offline pass-through is silent and successful",
+                "No approval directive was written to stdout".to_owned(),
+                Repairability::NotApplicable,
+                None,
+            ))
+        }
+        Ok((output, false)) => checks.push(diagnostic(
+            "hook.pass_through",
+            DiagnosticStatus::Fail,
+            "Runtime-offline pass-through violated the fail-open contract",
+            format!(
+                "exit={} stdout_bytes={} stderr_bytes={}",
+                output.status,
+                output.stdout.len(),
+                output.stderr.len()
+            ),
+            Repairability::Automatic,
+            Some("Repair or reinstall the stable hook binary"),
+        )),
+        Err(error) => checks.push(diagnostic(
+            "hook.pass_through",
+            DiagnosticStatus::Fail,
+            "Fail-open pass-through probe did not complete",
+            error.to_string(),
+            Repairability::Automatic,
+            Some("Repair or reinstall the stable hook binary"),
+        )),
+    }
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!("Flow Agent doctor: {:?}", report.overall);
+    for check in &report.checks {
+        let marker = match check.status {
+            DiagnosticStatus::Pass => "✓",
+            DiagnosticStatus::Warning => "!",
+            DiagnosticStatus::Fail => "×",
+        };
+        println!("[{marker}] {} — {}", check.id, check.summary);
+        println!("    {}", check.detail);
+        if let Some(action) = check.action.as_deref() {
+            println!("    next: {action}");
+        }
+    }
+}
+
+fn first_bounded_line(bytes: &[u8]) -> Option<String> {
+    let value = String::from_utf8_lossy(bytes);
+    let line = value.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(line.chars().take(256).collect())
+}
+
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> io::Result<(std::process::Output, bool)> {
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(|output| (output, false));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            return child.wait_with_output().map(|output| (output, true));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ensure_provider_cli(provider: HookProvider) -> Result<()> {
+    if find_provider_cli(provider).is_none() {
+        let executable = provider.as_str();
+        anyhow::bail!(
+            "{} CLI is not installed; refusing to create provider configuration",
+            executable
+        );
+    }
+    Ok(())
+}
+
+fn find_provider_cli(provider: HookProvider) -> Option<PathBuf> {
+    let executable = provider.as_str();
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|directory| {
+            let candidate = directory.join(executable);
+            std::fs::metadata(&candidate)
+                .map(|metadata| {
+                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                        .then_some(candidate)
+                })
+                .unwrap_or(None)
+        })
+    })
+}
+
 fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()> {
+    validate_socket_path(&socket_path).context("invalid runtime socket path")?;
     let paths = runtime_paths(&socket_path);
     let _instance = RuntimeInstanceGuard::acquire(&paths.lock)
         .with_context(|| format!("failed to acquire {}", paths.lock.display()))?;
@@ -162,6 +1026,40 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
             let Ok(request) = BridgeListener::read_request(&mut stream) else {
                 return;
             };
+            if request.event_name() == Some(DOCTOR_PROBE_EVENT) {
+                if let Some(request_id) = request.request_id {
+                    let mut response = flow_agent_core::BridgeResponse::pass_through(
+                        request_id,
+                        "doctor_probe_ok",
+                    );
+                    if let Ok(snapshot) = store.snapshot() {
+                        let latest_claude = snapshot
+                            .sessions
+                            .iter()
+                            .filter(|session| session.provider == "claude")
+                            .map(|session| session.last_event_at)
+                            .max();
+                        let latest_codex = snapshot
+                            .sessions
+                            .iter()
+                            .filter(|session| session.provider == "codex")
+                            .map(|session| session.last_event_at)
+                            .max();
+                        response.message = Some(
+                            json!({
+                                "eventCount": snapshot.event_count,
+                                "latestProviderEventAt": {
+                                    "claude": latest_claude,
+                                    "codex": latest_codex
+                                }
+                            })
+                            .to_string(),
+                        );
+                    }
+                    let _ = BridgeListener::write_response(&mut stream, &response);
+                }
+                return;
+            }
             let _ = writeln!(
                 io::stdout().lock(),
                 "provider={} event={} session={}",

@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_bridge::{BridgeClient, BridgeError};
+use flow_agent_bridge::{unix_socket_path_limit, validate_socket_path, BridgeClient, BridgeError};
 use flow_agent_core::{BridgeRequest, BridgeResponse, Decision, Provider};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -65,6 +65,21 @@ fn missing_runtime_fails_open_within_connection_budget() {
         .send(&request, Duration::from_secs(60))
         .is_err());
     assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn overlong_socket_path_is_reported_before_connect_or_bind() {
+    let maximum = unix_socket_path_limit();
+    let path = PathBuf::from(format!("/{}", "x".repeat(maximum)));
+    let error = validate_socket_path(&path).unwrap_err();
+    assert!(matches!(
+        error,
+        BridgeError::SocketPathTooLong {
+            actual,
+            maximum: reported,
+            ..
+        } if actual == maximum + 1 && reported == maximum
+    ));
 }
 
 #[test]

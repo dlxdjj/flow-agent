@@ -63,20 +63,20 @@ not weaken or replace the full plan.
 
 ### M3 - installation and onboarding
 
-- [ ] Claude and Codex hook installation uses backup, semantic merge, lock,
+- [x] Claude and Codex hook installation uses backup, semantic merge, lock,
       temporary file, and atomic rename.
-- [ ] Uninstall removes only Flow Agent entries and preserves user semantics.
-- [ ] Installation intent is tri-state and repair never recreates intentionally
+- [x] Uninstall removes only Flow Agent entries and preserves user semantics.
+- [x] Installation intent is tri-state and repair never recreates intentionally
       removed or uninstalled hooks.
-- [ ] Stable hook binary installation, `CODEX_HOME`, canonical/legacy feature
+- [x] Stable hook binary installation, `CODEX_HOME`, canonical/legacy feature
       detection, and Codex trust guidance are implemented.
-- [ ] `doctor` reports CLI/version, configuration, runtime, trust/probe state,
+- [x] `doctor` reports CLI/version, configuration, runtime, trust/probe state,
       control loop, and pass-through.
-- [ ] `doctor` emits structured, repairability-aware issues and refuses to
+- [x] `doctor` emits structured, repairability-aware issues and refuses to
       mutate malformed provider configuration.
-- [ ] `doctor` reports an overlong Unix Socket path before attempting Hook
+- [x] `doctor` reports an overlong Unix Socket path before attempting Hook
       installation or Runtime startup.
-- [ ] Unknown fields and events are visible and never panic.
+- [x] Unknown fields and events are visible and never panic.
 
 ### M4 - quota, settings, and P1
 

@@ -5,6 +5,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use flow_agent_installer::{
+    BinaryHealth, CodexTrustStatus, ConfigHealth, HookProvider, InstallOptions, InstallPaths,
+    Installer,
+};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, RuntimeStore, StoreError, WaiterRegistry,
 };
@@ -48,6 +52,8 @@ pub enum ApiServerError {
     Io(#[from] io::Error),
     #[error("API runtime thread failed: {0}")]
     Thread(String),
+    #[error("setup service failed: {0}")]
+    Setup(String),
 }
 
 pub struct ApiServer {
@@ -73,6 +79,10 @@ impl ApiServer {
             )));
         }
         let bootstrap_token = Uuid::now_v7().to_string();
+        let install_paths =
+            InstallPaths::discover().map_err(|error| ApiServerError::Setup(error.to_string()))?;
+        let source_binary =
+            std::env::current_exe().map_err(|error| ApiServerError::Setup(error.to_string()))?;
         let state = AppState {
             store,
             waiters,
@@ -85,6 +95,7 @@ impl ApiServer {
             expected_origin: format!("http://{address}"),
             commit_delay: config.commit_delay,
             snapshot_interval: config.snapshot_interval,
+            installer: Arc::new(Installer::new(install_paths, source_binary)),
         };
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -152,6 +163,7 @@ struct AppState {
     expected_origin: String,
     commit_delay: Duration,
     snapshot_interval: Duration,
+    installer: Arc<Installer>,
 }
 
 struct AuthState {
@@ -168,6 +180,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/bootstrap", post(bootstrap))
         .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/setup", get(setup).post(change_setup))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/commands/{id}/undo", post(undo))
         .route("/api/v1/ws", get(websocket))
@@ -256,6 +269,171 @@ async fn snapshot(State(state): State<AppState>, headers: HeaderMap) -> Response
         .map(Json)
         .map(IntoResponse::into_response)
         .unwrap_or_else(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR"))
+}
+
+async fn setup(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    setup_value(&state)
+        .map(Json)
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETUP_INSPECTION_FAILED",
+                &error,
+            )
+        })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupChangeRequest {
+    provider: String,
+    action: String,
+    #[serde(default)]
+    enhanced_codex_activity: bool,
+}
+
+async fn change_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SetupChangeRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let provider = match request.provider.as_str() {
+        "claude" => HookProvider::Claude,
+        "codex" => HookProvider::Codex,
+        _ => return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_PROVIDER"),
+    };
+    if request.action != "uninstall" && !provider_cli_available(provider) {
+        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+    }
+    let options = InstallOptions {
+        enhanced_codex_activity: request.enhanced_codex_activity,
+    };
+    let changed = match request.action.as_str() {
+        "install" => state.installer.install(provider, options).map(|_| ()),
+        "repair" => state.installer.repair(provider, options).map(|_| ()),
+        "uninstall" => state.installer.uninstall(provider).map(|_| ()),
+        _ => return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_SETUP_ACTION"),
+    };
+    if let Err(error) = changed {
+        return api_error_detail(
+            StatusCode::CONFLICT,
+            "SETUP_CHANGE_FAILED",
+            &error.to_string(),
+        );
+    }
+    setup_value(&state)
+        .map(Json)
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETUP_INSPECTION_FAILED",
+                &error,
+            )
+        })
+}
+
+fn setup_value(state: &AppState) -> Result<Value, String> {
+    let runtime = state.store.snapshot().map_err(|error| error.to_string())?;
+    let mut providers = Vec::new();
+    for provider in [HookProvider::Claude, HookProvider::Codex] {
+        let inspection = state
+            .installer
+            .inspect(provider)
+            .map_err(|error| error.to_string())?;
+        let cli_installed = provider_cli_available(provider);
+        let real_event_verified =
+            inspection
+                .installed_definition_changed_at_ms
+                .is_some_and(|installed_at| {
+                    runtime.sessions.iter().any(|session| {
+                        session.provider == provider.as_str()
+                            && session.last_event_at >= installed_at
+                    })
+                });
+        let status = if !cli_installed {
+            "cli_missing"
+        } else if inspection.config_health == ConfigHealth::Malformed
+            || inspection.codex_config_error.is_some()
+        {
+            "error"
+        } else if !inspection.codex_inline_events.is_empty() {
+            "inline_conflict"
+        } else if inspection.definition_matches_manifest
+            && inspection.binary_health == BinaryHealth::Executable
+        {
+            if real_event_verified
+                && (provider != HookProvider::Codex
+                    || inspection.codex_trust_status == Some(CodexTrustStatus::TrustedStatePresent))
+            {
+                "connected"
+            } else if provider == HookProvider::Codex
+                && inspection.codex_trust_status == Some(CodexTrustStatus::ReviewRequired)
+            {
+                "needs_trust"
+            } else {
+                "installed_unverified"
+            }
+        } else if inspection.owned_handlers > 0 {
+            "needs_reinstall"
+        } else {
+            "not_installed"
+        };
+        providers.push(json!({
+            "provider": provider.as_str(),
+            "status": status,
+            "cliInstalled": cli_installed,
+            "intent": inspection.intent,
+            "configPath": inspection.config_path,
+            "ownedHandlers": inspection.owned_handlers,
+            "expectedHandlers": inspection.expected_handlers,
+            "binaryHealth": inspection.binary_health,
+            "trustStatus": inspection.codex_trust_status,
+            "featureStatus": inspection.codex_feature_status,
+            "inlineEvents": inspection.codex_inline_events,
+            "canRepair": inspection.definition_matches_manifest
+                && inspection.binary_health != BinaryHealth::Executable,
+            "realEventVerified": real_event_verified,
+        }));
+    }
+    let first_run = providers.iter().all(|provider| {
+        matches!(
+            provider.get("status").and_then(Value::as_str),
+            Some("not_installed") | Some("cli_missing")
+        )
+    });
+    Ok(json!({
+        "schemaVersion": 1,
+        "firstRun": first_run,
+        "providers": providers,
+        "safety": {
+            "backsUpBeforeWrite": true,
+            "codexTrustIsManual": true,
+            "repairRespectsRemoval": true
+        }
+    }))
+}
+
+fn provider_cli_available(provider: HookProvider) -> bool {
+    let executable = provider.as_str();
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| {
+            let candidate = directory.join(executable);
+            std::fs::metadata(candidate)
+                .map(|metadata| {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+                .unwrap_or(false)
+        })
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,6 +679,14 @@ fn api_error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(json!({ "error": { "code": code } }))).into_response()
 }
 
+fn api_error_detail(status: StatusCode, code: &'static str, detail: &str) -> Response {
+    (
+        status,
+        Json(json!({ "error": { "code": code, "detail": detail } })),
+    )
+        .into_response()
+}
+
 fn valid_host(state: &AppState, headers: &HeaderMap) -> bool {
     headers.get(HOST).and_then(|value| value.to_str().ok()) == Some(state.expected_host.as_str())
 }
@@ -570,6 +756,17 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(store: RuntimeStore) -> AppState {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-installer-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let paths = InstallPaths {
+            flow_home: root.join("flow-home"),
+            claude_settings: root.join("home/.claude/settings.json"),
+            codex_hooks: root.join("codex/hooks.json"),
+            codex_config: root.join("codex/config.toml"),
+        };
         AppState {
             store,
             waiters: WaiterRegistry::default(),
@@ -582,6 +779,7 @@ mod tests {
             expected_origin: "http://127.0.0.1:43111".to_owned(),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
+            installer: Arc::new(Installer::new(paths, std::env::current_exe().unwrap())),
         }
     }
 
@@ -656,6 +854,43 @@ mod tests {
             let bytes = to_bytes(bootstrap.into_body(), 4096).await.unwrap();
             let payload: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(payload["csrfToken"].as_str().is_some());
+
+            let setup = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/setup")
+                        .header(HOST, "127.0.0.1:43111")
+                        .header(COOKIE, cookie.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(setup.status(), StatusCode::OK);
+            let setup_bytes = to_bytes(setup.into_body(), 16 * 1024).await.unwrap();
+            let setup_payload: Value = serde_json::from_slice(&setup_bytes).unwrap();
+            assert_eq!(setup_payload["schemaVersion"], 1);
+            assert_eq!(setup_payload["providers"].as_array().unwrap().len(), 2);
+
+            let setup_without_csrf = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/setup")
+                        .header(HOST, "127.0.0.1:43111")
+                        .header(ORIGIN, "http://127.0.0.1:43111")
+                        .header(COOKIE, cookie.clone())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"provider":"claude","action":"install"}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(setup_without_csrf.status(), StatusCode::FORBIDDEN);
 
             let missing_csrf = app
                 .oneshot(

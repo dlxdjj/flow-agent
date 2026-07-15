@@ -11,6 +11,7 @@ pub const MAX_HOOK_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const CLAUDE_PERMISSION_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const CODEX_PERMISSION_DEADLINE_MS: u64 = 60 * 60 * 1_000;
 pub const PERMISSION_COMMIT_DELAY_MS: u64 = 3_000;
+pub const DOCTOR_PROBE_EVENT: &str = "FlowAgentDoctorProbe";
 
 pub const fn permission_deadline_ms(provider: Provider) -> Option<u64> {
     match provider {
@@ -380,6 +381,28 @@ impl BridgeRequest {
             needs_reply,
             term: terminal_context(),
             raw,
+        }
+    }
+
+    pub fn doctor_probe_at(received_at: u64) -> Self {
+        let request_id = Uuid::now_v7();
+        Self {
+            v: PROTOCOL_VERSION,
+            id: Uuid::now_v7(),
+            request_id: Some(request_id),
+            provider: Provider::Claude,
+            provider_session_id: Some("flow-agent-doctor".to_owned()),
+            provider_turn_id: None,
+            prompt_id: None,
+            role: "diagnostic".to_owned(),
+            received_at,
+            deadline_at: Some(received_at.saturating_add(1_000)),
+            needs_reply: true,
+            term: None,
+            raw: serde_json::json!({
+                "hook_event_name": DOCTOR_PROBE_EVENT,
+                "session_id": "flow-agent-doctor"
+            }),
         }
     }
 

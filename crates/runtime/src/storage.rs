@@ -153,6 +153,8 @@ pub struct SessionRecord {
     pub exec_state: String,
     pub approval_owner: Option<String>,
     pub activity: Option<String>,
+    pub plan_done: Option<u32>,
+    pub plan_total: Option<u32>,
     pub last_event_at: u64,
 }
 
@@ -594,6 +596,24 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               FOREIGN KEY(session_id) REFERENCES sessions(id),
               FOREIGN KEY(turn_id) REFERENCES turns(id)
             );
+            CREATE TABLE IF NOT EXISTS session_tasks (
+              session_id TEXT NOT NULL,
+              task_id TEXT NOT NULL,
+              completed INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              completed_at INTEGER,
+              PRIMARY KEY(session_id, task_id),
+              FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            CREATE TABLE IF NOT EXISTS session_subagents (
+              session_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 1,
+              started_at INTEGER NOT NULL,
+              stopped_at INTEGER,
+              PRIMARY KEY(session_id, agent_id),
+              FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
             CREATE TABLE IF NOT EXISTS attention_items (
               id TEXT PRIMARY KEY,
               session_id TEXT NOT NULL, provider TEXT NOT NULL, project TEXT,
@@ -769,15 +789,30 @@ fn ingest_transaction(
         )
         .map_err(storage_error)?;
 
-    let stopped_after_write = if parsed.kind == EventKind::Stopped {
-        turn_id
-            .as_deref()
-            .map(|turn| turn_has_write_tool(&transaction, turn))
-            .transpose()?
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let stopped_after_write =
+        if parsed.kind == EventKind::Stopped && !has_background_work(&request.raw) {
+            turn_id
+                .as_deref()
+                .map(|turn| turn_has_write_tool(&transaction, turn))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+    let plan_progress = update_task_progress(
+        &transaction,
+        &session_id,
+        parsed.kind,
+        &request.raw,
+        occurred_at,
+    )?;
+    let active_subagents = update_subagent_activity(
+        &transaction,
+        &session_id,
+        parsed.kind,
+        &request.raw,
+        occurred_at,
+    )?;
     let attention_id = match parsed.kind {
         EventKind::PermissionRequested => Some(insert_approval_attention(
             &transaction,
@@ -856,13 +891,27 @@ fn ingest_transaction(
                 EventKind::PromptSubmitted | EventKind::SessionStarted | EventKind::SessionEnded
             ));
     if may_update {
-        let (next_state, owner, activity) =
+        let (next_state, owner, default_activity) =
             project_event(parsed.kind, &request.raw, &current_state);
+        let activity = plan_progress
+            .map(|(done, total)| format!("计划进度 {done}/{total}"))
+            .or_else(|| {
+                active_subagents.map(|active| {
+                    if active == 0 {
+                        "子 Agent 已结束".to_owned()
+                    } else {
+                        format!("派了 {active} 个子 Agent")
+                    }
+                })
+            })
+            .unwrap_or(default_activity);
         transaction
             .execute(
                 "UPDATE sessions SET
                    exec_state = ?2, approval_owner = ?3, activity = ?4,
                    activity_since = ?5, last_event_at = ?5,
+                   plan_done = COALESCE(?7, plan_done),
+                   plan_total = COALESCE(?8, plan_total),
                    ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
                  WHERE id = ?1",
                 params![
@@ -872,6 +921,8 @@ fn ingest_transaction(
                     activity,
                     occurred_at,
                     i64::from(parsed.kind == EventKind::SessionEnded),
+                    plan_progress.map(|(done, _)| i64::from(done)),
+                    plan_progress.map(|(_, total)| i64::from(total)),
                 ],
             )
             .map_err(storage_error)?;
@@ -1353,7 +1404,8 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
         let mut statement = connection
             .prepare(
                 "SELECT id, provider, provider_session_id, project, model,
-                        exec_state, approval_owner, activity, last_event_at
+                        exec_state, approval_owner, activity, plan_done,
+                        plan_total, last_event_at
                  FROM sessions ORDER BY last_event_at DESC",
             )
             .map_err(storage_error)?;
@@ -1368,7 +1420,13 @@ fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
                     exec_state: row.get(5)?,
                     approval_owner: row.get(6)?,
                     activity: row.get(7)?,
-                    last_event_at: from_i64(row.get(8)?),
+                    plan_done: row
+                        .get::<_, Option<i64>>(8)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    plan_total: row
+                        .get::<_, Option<i64>>(9)?
+                        .and_then(|value| u32::try_from(value).ok()),
+                    last_event_at: from_i64(row.get(10)?),
                 })
             })
             .map_err(storage_error)?
@@ -1745,6 +1803,121 @@ fn confirm_allowed_command(
     Ok(())
 }
 
+fn update_task_progress(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    kind: EventKind,
+    raw: &Value,
+    occurred_at: i64,
+) -> Result<Option<(u32, u32)>, StoreError> {
+    if !matches!(kind, EventKind::TaskCreated | EventKind::TaskCompleted) {
+        return Ok(None);
+    }
+    let Some(task_id) = raw
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|task_id| !task_id.is_empty() && task_id.len() <= 256)
+    else {
+        return Ok(None);
+    };
+    if kind == EventKind::TaskCreated {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_tasks (
+                   session_id, task_id, completed, created_at
+                 ) VALUES (?1, ?2, 0, ?3)",
+                params![session_id, task_id, occurred_at],
+            )
+            .map_err(storage_error)?;
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO session_tasks (
+                   session_id, task_id, completed, created_at, completed_at
+                 ) VALUES (?1, ?2, 1, ?3, ?3)
+                 ON CONFLICT(session_id, task_id) DO UPDATE SET
+                   completed = 1,
+                   completed_at = COALESCE(session_tasks.completed_at, excluded.completed_at)",
+                params![session_id, task_id, occurred_at],
+            )
+            .map_err(storage_error)?;
+    }
+    let (done, total) = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(completed), 0), COUNT(*)
+             FROM session_tasks WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(storage_error)?;
+    Ok(Some((
+        u32::try_from(done).unwrap_or(u32::MAX),
+        u32::try_from(total).unwrap_or(u32::MAX),
+    )))
+}
+
+fn update_subagent_activity(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    kind: EventKind,
+    raw: &Value,
+    occurred_at: i64,
+) -> Result<Option<u32>, StoreError> {
+    if !matches!(
+        kind,
+        EventKind::SubagentStarted | EventKind::SubagentStopped
+    ) {
+        return Ok(None);
+    }
+    let Some(agent_id) = raw
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|agent_id| !agent_id.is_empty() && agent_id.len() <= 256)
+    else {
+        return Ok(None);
+    };
+    if kind == EventKind::SubagentStarted {
+        transaction
+            .execute(
+                "INSERT INTO session_subagents (
+                   session_id, agent_id, active, started_at
+                 ) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET active = 1",
+                params![session_id, agent_id, occurred_at],
+            )
+            .map_err(storage_error)?;
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO session_subagents (
+                   session_id, agent_id, active, started_at, stopped_at
+                 ) VALUES (?1, ?2, 0, ?3, ?3)
+                 ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                   active = 0,
+                   stopped_at = COALESCE(session_subagents.stopped_at, excluded.stopped_at)",
+                params![session_id, agent_id, occurred_at],
+            )
+            .map_err(storage_error)?;
+    }
+    let active = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM session_subagents
+             WHERE session_id = ?1 AND active = 1",
+            [session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage_error)?;
+    Ok(Some(u32::try_from(active).unwrap_or(u32::MAX)))
+}
+
+fn has_background_work(raw: &Value) -> bool {
+    ["background_tasks", "session_crons"].iter().any(|field| {
+        raw.get(*field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    })
+}
+
 fn project_event<'a>(
     kind: EventKind,
     raw: &Value,
@@ -1772,6 +1945,14 @@ fn project_event<'a>(
             ("awaiting_approval", Some("widget"), "等待你批准".to_owned())
         }
         EventKind::Compacting => ("compacting", None, "正在压缩记忆".to_owned()),
+        EventKind::Stopped if has_background_work(raw) => {
+            let count = ["background_tasks", "session_crons"]
+                .iter()
+                .filter_map(|field| raw.get(*field).and_then(Value::as_array))
+                .map(Vec::len)
+                .sum::<usize>();
+            ("tool_running", None, format!("后台任务仍在运行 · {count}"))
+        }
         EventKind::Stopped => ("response_finished", None, "本轮已完成".to_owned()),
         EventKind::Failed => ("failed", None, "运行失败".to_owned()),
         EventKind::Unknown => (current, None, "⚠ 事件不识别（可能版本不兼容）".to_owned()),

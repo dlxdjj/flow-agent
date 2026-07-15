@@ -72,6 +72,14 @@ fn versioned_fixtures_replay_idempotently_into_wal() {
         ),
         (
             Provider::Claude,
+            include_str!("../../../fixtures/claude/2.1.210/task-created.json"),
+        ),
+        (
+            Provider::Claude,
+            include_str!("../../../fixtures/claude/2.1.210/task-completed.json"),
+        ),
+        (
+            Provider::Claude,
             include_str!("../../../fixtures/claude/2.1.210/stop.json"),
         ),
         (
@@ -124,6 +132,12 @@ fn versioned_fixtures_replay_idempotently_into_wal() {
         .sessions
         .iter()
         .all(|session| session.exec_state == "response_finished"));
+    let claude = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.provider == "claude")
+        .unwrap();
+    assert_eq!((claude.plan_done, claude.plan_total), (Some(1), Some(1)));
     drop(store);
 
     let connection = Connection::open(&database).unwrap();
@@ -674,6 +688,143 @@ fn runtime_lock_allows_only_one_instance_and_is_reusable_after_drop() {
     );
     drop(first);
     RuntimeInstanceGuard::acquire(&lock).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claude_task_progress_uses_only_stable_task_ids_and_never_invents_a_percentage() {
+    let root = temp_root("task-progress");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let event = |name: &str, task_id: Option<&str>, at: u64| {
+        let mut raw = json!({
+            "hook_event_name": name,
+            "session_id": "task-session",
+            "cwd": "/tmp/example-project"
+        });
+        if let Some(task_id) = task_id {
+            raw["task_id"] = Value::String(task_id.to_owned());
+            raw["task_subject"] = Value::String("fact-only subject".to_owned());
+        }
+        BridgeRequest::from_hook_at(Provider::Claude, raw, at)
+    };
+
+    store
+        .ingest(event("TaskCreated", Some("task-1"), 1_000))
+        .unwrap();
+    store
+        .ingest(event("TaskCreated", Some("task-2"), 1_001))
+        .unwrap();
+    store
+        .ingest(event("TaskCreated", Some("task-1"), 1_002))
+        .unwrap();
+    let created = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!((created.plan_done, created.plan_total), (Some(0), Some(2)));
+    assert_eq!(created.activity.as_deref(), Some("计划进度 0/2"));
+
+    store
+        .ingest(event("TaskCompleted", Some("task-1"), 1_003))
+        .unwrap();
+    store
+        .ingest(event("TaskCompleted", Some("task-1"), 1_004))
+        .unwrap();
+    let half = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!((half.plan_done, half.plan_total), (Some(1), Some(2)));
+
+    store.ingest(event("TaskCompleted", None, 1_005)).unwrap();
+    let missing_identity = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(
+        (missing_identity.plan_done, missing_identity.plan_total),
+        (Some(1), Some(2)),
+        "a task event without task_id must not alter factual progress"
+    );
+
+    store
+        .ingest(event("TaskCompleted", Some("task-2"), 1_006))
+        .unwrap();
+    let completed = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(
+        (completed.plan_done, completed.plan_total),
+        (Some(2), Some(2))
+    );
+    assert_eq!(completed.activity.as_deref(), Some("计划进度 2/2"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn subagent_counts_and_background_stop_state_are_fact_based() {
+    let root = temp_root("subagents-background");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let subagent = |event: &str, agent_id: Option<&str>, at: u64| {
+        let mut raw = json!({
+            "hook_event_name": event,
+            "session_id": "subagent-session",
+            "cwd": "/tmp/example-project"
+        });
+        if let Some(agent_id) = agent_id {
+            raw["agent_id"] = Value::String(agent_id.to_owned());
+            raw["agent_type"] = Value::String("Explore".to_owned());
+        }
+        BridgeRequest::from_hook_at(Provider::Claude, raw, at)
+    };
+    store
+        .ingest(subagent("SubagentStart", Some("agent-1"), 2_000))
+        .unwrap();
+    store
+        .ingest(subagent("SubagentStart", Some("agent-2"), 2_001))
+        .unwrap();
+    store
+        .ingest(subagent("SubagentStart", Some("agent-1"), 2_002))
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].activity.as_deref(),
+        Some("派了 2 个子 Agent")
+    );
+    store
+        .ingest(subagent("SubagentStop", Some("agent-1"), 2_003))
+        .unwrap();
+    assert_eq!(
+        store.snapshot().unwrap().sessions[0].activity.as_deref(),
+        Some("派了 1 个子 Agent")
+    );
+
+    let tool = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "background-session",
+            "cwd": "/tmp/example-project",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/tmp/example-project/file.txt"}
+        }),
+        3_000,
+    );
+    store.ingest(tool).unwrap();
+    let stop = BridgeRequest::from_hook_at(
+        Provider::Claude,
+        json!({
+            "hook_event_name": "Stop",
+            "session_id": "background-session",
+            "cwd": "/tmp/example-project",
+            "background_tasks": [{"id": "bg-1", "type": "shell", "status": "running"}],
+            "session_crons": []
+        }),
+        3_001,
+    );
+    store.ingest(stop).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let background = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.provider_session_id == "background-session")
+        .unwrap();
+    assert_eq!(background.exec_state, "tool_running");
+    assert_eq!(background.activity.as_deref(), Some("后台任务仍在运行 · 1"));
+    assert!(snapshot
+        .attention
+        .iter()
+        .all(|attention| attention.session_id != background.id));
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 

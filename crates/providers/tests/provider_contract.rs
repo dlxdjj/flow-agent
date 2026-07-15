@@ -54,6 +54,8 @@ fn supported_lifecycle_events_map_to_normalized_kinds() {
         ("PreToolUse", EventKind::ToolStarted),
         ("PostToolUse", EventKind::ToolFinished),
         ("PermissionRequest", EventKind::PermissionRequested),
+        ("TaskCreated", EventKind::TaskCreated),
+        ("TaskCompleted", EventKind::TaskCompleted),
         ("Stop", EventKind::Stopped),
     ];
 
@@ -116,6 +118,21 @@ fn versioned_fixture_sets_match_provider_contracts() {
             parse_hook(provider, raw).unwrap().kind,
             EventKind::PermissionRequested
         );
+    }
+
+    for fixture in [
+        include_str!("../../../fixtures/claude/2.1.210/task-created.json"),
+        include_str!("../../../fixtures/claude/2.1.210/task-completed.json"),
+    ] {
+        let raw = serde_json::from_str::<serde_json::Value>(fixture).unwrap();
+        assert!(raw
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .is_some());
+        assert!(matches!(
+            parse_hook(Provider::Claude, raw).unwrap().kind,
+            EventKind::TaskCreated | EventKind::TaskCompleted
+        ));
     }
 }
 
