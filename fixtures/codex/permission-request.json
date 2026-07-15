@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PermissionRequest",
+  "session_id": "fixture-codex-permission",
+  "cwd": "/tmp/example-project",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git push"
+  }
+}

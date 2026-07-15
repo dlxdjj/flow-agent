@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BIN="$ROOT/target/release/flow-agent"
+TMP_ROOT="${TMPDIR:-/private/tmp}/flow-agent-m0-e2e-$$"
+SOCKET="$TMP_ROOT/bridge.sock"
+SERVER_LOG="$TMP_ROOT/server.log"
+SERVER_PID=""
+
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$SOCKET" "$SERVER_LOG"
+    rmdir "$TMP_ROOT" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+wait_for_socket() {
+    attempts=0
+    while [ ! -S "$SOCKET" ]; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 100 ]; then
+            echo "runtime socket did not become ready" >&2
+            exit 1
+        fi
+        sleep 0.05
+    done
+}
+
+start_server() {
+    mode=$1
+    mkdir -p "$TMP_ROOT"
+    "$BIN" serve --approval "$mode" --socket "$SOCKET" >"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    wait_for_socket
+}
+
+stop_server() {
+    kill "$SERVER_PID"
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+    rm -f "$SOCKET"
+}
+
+start_server allow
+allow_output=$("$BIN" hook --provider claude --socket "$SOCKET" \
+    <"$ROOT/fixtures/claude/permission-request.json")
+case "$allow_output" in
+    *'"behavior":"allow"'*) ;;
+    *) echo "Claude allow directive mismatch: $allow_output" >&2; exit 1 ;;
+esac
+stop_server
+
+start_server deny
+deny_output=$("$BIN" hook --provider codex --socket "$SOCKET" \
+    <"$ROOT/fixtures/codex/permission-request.json")
+case "$deny_output" in
+    *'"behavior":"deny"'*) ;;
+    *) echo "Codex deny directive mismatch: $deny_output" >&2; exit 1 ;;
+esac
+stop_server
+
+fail_open_output=$("$BIN" hook --provider codex \
+    --socket "$TMP_ROOT/missing.sock" \
+    <"$ROOT/fixtures/codex/permission-request.json")
+if [ -n "$fail_open_output" ]; then
+    echo "fail-open hook unexpectedly wrote to stdout: $fail_open_output" >&2
+    exit 1
+fi
+
+echo "M0 E2E passed: Claude allow, Codex deny, missing-runtime fail-open"
