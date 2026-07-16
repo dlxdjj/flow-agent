@@ -1,12 +1,14 @@
 use crate::fsutil::ensure_private_directory;
 use flow_agent_core::{BridgeRequest, Decision, EventKind, Provider, PERMISSION_COMMIT_DELAY_MS};
 use flow_agent_providers::parse_hook;
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -198,6 +200,17 @@ pub struct StoreSnapshot {
     pub event_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaRecord {
+    pub provider: String,
+    pub window: String,
+    pub used_pct: f64,
+    pub resets_at: u64,
+    pub source: String,
+    pub captured_at: u64,
+}
+
 #[derive(Clone)]
 pub struct RuntimeStore {
     inner: Arc<StoreInner>,
@@ -258,6 +271,31 @@ enum StoreMessage {
     Snapshot {
         reply: mpsc::SyncSender<Result<StoreSnapshot, StoreError>>,
     },
+    ReadSetting {
+        key: String,
+        reply: mpsc::SyncSender<Result<Option<String>, StoreError>>,
+    },
+    WriteSetting {
+        key: String,
+        value: String,
+        reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
+    ReplaceQuota {
+        entries: Vec<QuotaRecord>,
+        reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
+    PruneEvents {
+        retention_days: u32,
+        now: u64,
+        reply: mpsc::SyncSender<Result<usize, StoreError>>,
+    },
+    Export {
+        now: u64,
+        reply: mpsc::SyncSender<Result<Value, StoreError>>,
+    },
+    ClearData {
+        reply: mpsc::SyncSender<Result<(), StoreError>>,
+    },
     Shutdown,
 }
 
@@ -280,7 +318,7 @@ impl RuntimeStore {
         let (sender, receiver) = mpsc::channel();
         let writer = thread::Builder::new()
             .name("flow-agent-sqlite-writer".to_owned())
-            .spawn(move || writer_loop(connection, receiver))
+            .spawn(move || writer_loop(connection, path, receiver))
             .map_err(|error| StoreError::Storage(error.to_string()))?;
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -413,6 +451,57 @@ impl RuntimeStore {
         receive(receiver)
     }
 
+    pub fn read_setting(&self, key: impl Into<String>) -> Result<Option<String>, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ReadSetting {
+            key: key.into(),
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    pub fn write_setting(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::WriteSetting {
+            key: key.into(),
+            value: value.into(),
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    pub fn replace_quota_snapshots(&self, entries: Vec<QuotaRecord>) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ReplaceQuota { entries, reply })?;
+        receive(receiver)
+    }
+
+    pub fn prune_events(&self, retention_days: u32, now: u64) -> Result<usize, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::PruneEvents {
+            retention_days,
+            now,
+            reply,
+        })?;
+        receive(receiver)
+    }
+
+    pub fn export_json(&self, now: u64) -> Result<Value, StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::Export { now, reply })?;
+        receive(receiver)
+    }
+
+    pub fn clear_data(&self) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.send(StoreMessage::ClearData { reply })?;
+        receive(receiver)
+    }
+
     fn send(&self, message: StoreMessage) -> Result<(), StoreError> {
         self.inner
             .sender
@@ -436,7 +525,11 @@ fn receive<T>(receiver: mpsc::Receiver<Result<T, StoreError>>) -> Result<T, Stor
     receiver.recv().map_err(|_| StoreError::WriterStopped)?
 }
 
-fn writer_loop(mut connection: Connection, receiver: mpsc::Receiver<StoreMessage>) {
+fn writer_loop(
+    mut connection: Connection,
+    database_path: PathBuf,
+    receiver: mpsc::Receiver<StoreMessage>,
+) {
     while let Ok(message) = receiver.recv() {
         match message {
             StoreMessage::Ingest { request, reply } => {
@@ -534,9 +627,212 @@ fn writer_loop(mut connection: Connection, receiver: mpsc::Receiver<StoreMessage
                     .and_then(|_| read_snapshot(&connection));
                 let _ = reply.send(result);
             }
+            StoreMessage::ReadSetting { key, reply } => {
+                let result = connection
+                    .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()
+                    .map_err(storage_error);
+                let _ = reply.send(result);
+            }
+            StoreMessage::WriteSetting { key, value, reply } => {
+                let result = connection
+                    .execute(
+                        "INSERT INTO settings(key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![key, value],
+                    )
+                    .map(|_| ())
+                    .map_err(storage_error);
+                let _ = reply.send(result);
+            }
+            StoreMessage::ReplaceQuota { entries, reply } => {
+                let _ = reply.send(replace_quota_transaction(&mut connection, entries));
+            }
+            StoreMessage::PruneEvents {
+                retention_days,
+                now,
+                reply,
+            } => {
+                let _ = reply.send(prune_events_transaction(
+                    &mut connection,
+                    retention_days,
+                    now,
+                ));
+            }
+            StoreMessage::Export { now, reply } => {
+                let _ = reply.send(export_database(&connection, now));
+            }
+            StoreMessage::ClearData { reply } => {
+                let _ = reply.send(reset_database(&mut connection, &database_path));
+            }
             StoreMessage::Shutdown => break,
         }
     }
+}
+
+fn replace_quota_transaction(
+    connection: &mut Connection,
+    entries: Vec<QuotaRecord>,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage_error)?;
+    transaction
+        .execute("DELETE FROM quota_snapshots", [])
+        .map_err(storage_error)?;
+    for entry in entries {
+        if !entry.used_pct.is_finite() || !(0.0..=100.0).contains(&entry.used_pct) {
+            return Err(StoreError::Storage(
+                "quota percentage is outside 0..=100".to_owned(),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO quota_snapshots(
+                   provider, window, used_pct, resets_at, source, captured_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    entry.provider,
+                    entry.window,
+                    entry.used_pct,
+                    to_i64(entry.resets_at),
+                    entry.source,
+                    to_i64(entry.captured_at),
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)
+}
+
+fn prune_events_transaction(
+    connection: &mut Connection,
+    retention_days: u32,
+    now: u64,
+) -> Result<usize, StoreError> {
+    if !matches!(retention_days, 30 | 90 | 365) {
+        return Err(StoreError::Storage(
+            "retention days must be 30, 90, or 365".to_owned(),
+        ));
+    }
+    let cutoff = now.saturating_sub(u64::from(retention_days) * 86_400_000);
+    connection
+        .execute(
+            "DELETE FROM events WHERE occurred_at < ?1",
+            [to_i64(cutoff)],
+        )
+        .map_err(storage_error)
+}
+
+fn export_database(connection: &Connection, now: u64) -> Result<Value, StoreError> {
+    let mut names_statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .map_err(storage_error)?;
+    let table_names = names_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    drop(names_statement);
+    let mut tables = Map::new();
+    for table in table_names {
+        if !table
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(StoreError::Storage(
+                "database contains an unsafe table name".to_owned(),
+            ));
+        }
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .map_err(storage_error)?;
+        let columns = statement
+            .column_names()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let rows = statement
+            .query_map([], |row| {
+                let mut object = Map::new();
+                for (index, column) in columns.iter().enumerate() {
+                    object.insert(column.clone(), sqlite_value(row.get_ref(index)?));
+                }
+                Ok(Value::Object(object))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        tables.insert(table, Value::Array(rows));
+    }
+    Ok(Value::Object(Map::from_iter([
+        ("schemaVersion".to_owned(), Value::Number(1.into())),
+        ("exportedAt".to_owned(), Value::Number(now.into())),
+        ("tables".to_owned(), Value::Object(tables)),
+    ])))
+}
+
+fn sqlite_value(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(value) => Value::Number(value.into()),
+        ValueRef::Real(value) => Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        ValueRef::Text(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
+        ValueRef::Blob(value) => Value::String(format!("hex:{}", hex(value))),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn reset_database(connection: &mut Connection, path: &Path) -> Result<(), StoreError> {
+    let placeholder = Connection::open_in_memory().map_err(storage_error)?;
+    let old = std::mem::replace(connection, placeholder);
+    if let Err((old, error)) = old.close() {
+        *connection = old;
+        return Err(storage_error(error));
+    }
+    for candidate in database_files(path) {
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let reopened = Connection::open(path).map_err(storage_error)?;
+                initialize(&reopened)?;
+                *connection = reopened;
+                return Err(StoreError::Storage(format!(
+                    "failed to remove {}: {error}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    prepare_database_file(path)?;
+    let fresh = Connection::open(path).map_err(storage_error)?;
+    initialize(&fresh)?;
+    *connection = fresh;
+    Ok(())
+}
+
+fn database_files(path: &Path) -> [PathBuf; 3] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    [path.to_path_buf(), PathBuf::from(wal), PathBuf::from(shm)]
 }
 
 fn prepare_database_file(path: &Path) -> Result<(), StoreError> {

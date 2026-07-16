@@ -282,6 +282,7 @@ dependencies = [
  "flow-agent-bridge",
  "flow-agent-core",
  "flow-agent-installer",
+ "flow-agent-quota",
  "flow-agent-runtime",
  "flow-agent-server",
  "libc",
@@ -333,6 +334,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flow-agent-quota"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "flow-agent-runtime"
 version = "0.1.0"
 dependencies = [
@@ -353,6 +363,7 @@ dependencies = [
  "axum",
  "flow-agent-core",
  "flow-agent-installer",
+ "flow-agent-quota",
  "flow-agent-runtime",
  "futures-util",
  "serde",

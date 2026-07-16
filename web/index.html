@@ -15,6 +15,7 @@
       </div>
       <div class="top-actions">
         <button class="setup-trigger" id="setup-trigger" type="button">接入设置</button>
+        <button class="setup-trigger" id="settings-trigger" type="button" aria-label="打开通知与数据设置">设置</button>
         <div class="runtime-state" id="runtime-state" role="status">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="runtime-label">正在连接本地 Runtime</span>
@@ -86,6 +87,55 @@
         </footer>
       </section>
     </div>
+
+    <div class="setup-overlay" id="settings-overlay" hidden>
+      <section class="setup-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <header class="setup-header">
+          <div>
+            <p class="eyebrow">LOCAL SETTINGS</p>
+            <h2 id="settings-title">通知与数据</h2>
+            <p>所有设置和数据都只留在这台 Mac；Flow Agent 不发送遥测。</p>
+          </div>
+          <button class="setup-close" id="settings-close" type="button" aria-label="关闭设置">×</button>
+        </header>
+        <div class="settings-grid">
+          <section class="settings-card">
+            <h3>什么时候提醒</h3>
+            <label>等待批准<select id="notify-approval"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
+            <label>Agent 提问<select id="notify-question"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
+            <label>出错 / 卡住<select id="notify-error"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
+            <label>任务完成<select id="notify-completion"><option value="banner">弹窗</option><option value="list">仅列表</option><option value="ignore">忽略提醒</option></select></label>
+            <label class="toggle-row"><span>提示音</span><input id="sound-enabled" type="checkbox"></label>
+          </section>
+          <section class="settings-card">
+            <h3>Agent 与额度</h3>
+            <label class="toggle-row"><span>Claude 静音</span><input id="mute-claude" type="checkbox"></label>
+            <label class="toggle-row"><span>Codex 静音</span><input id="mute-codex" type="checkbox"></label>
+            <label class="toggle-row"><span>Codex 工具级事件</span><input id="codex-enhanced" type="checkbox"></label>
+            <p class="settings-note">切换 Codex 工具级事件会重装 Hook，并需要重新运行 /hooks 检查信任。</p>
+            <div class="bridge-setting">
+              <div><strong>Claude 额度桥</strong><span id="claude-bridge-status">正在检查</span></div>
+              <button id="claude-bridge-action" type="button">开启</button>
+            </div>
+          </section>
+          <section class="settings-card data-settings">
+            <h3>本地数据</h3>
+            <label>事件保留<select id="retention-days"><option value="30">30 天</option><option value="90">90 天</option><option value="365">365 天</option></select></label>
+            <div class="data-actions">
+              <button id="export-data" type="button">导出 JSON</button>
+              <button id="clear-data" class="danger" type="button">彻底清除</button>
+            </div>
+            <p class="settings-note">彻底清除需要输入 DELETE；Hook 接入和备份不会被删除。</p>
+          </section>
+        </div>
+      </section>
+    </div>
+
+    <aside class="notification-banner" id="notification-banner" role="alert" hidden>
+      <div><span id="notification-kind">Agent 提醒</span><strong id="notification-title"></strong></div>
+      <button id="notification-view" type="button">查看</button>
+      <button id="notification-close" class="notification-close" type="button" aria-label="关闭提醒">×</button>
+    </aside>
 
     <div class="undo-toast" id="undo-toast" role="status" hidden>
       <span id="undo-message">决定将在 3 秒后提交</span>

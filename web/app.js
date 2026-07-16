@@ -19,6 +19,27 @@ const ui = {
   setupClose: document.querySelector("#setup-close"),
   setupProviders: document.querySelector("#setup-providers"),
   setupRefresh: document.querySelector("#setup-refresh"),
+  settingsTrigger: document.querySelector("#settings-trigger"),
+  settingsOverlay: document.querySelector("#settings-overlay"),
+  settingsClose: document.querySelector("#settings-close"),
+  notifyApproval: document.querySelector("#notify-approval"),
+  notifyQuestion: document.querySelector("#notify-question"),
+  notifyError: document.querySelector("#notify-error"),
+  notifyCompletion: document.querySelector("#notify-completion"),
+  soundEnabled: document.querySelector("#sound-enabled"),
+  muteClaude: document.querySelector("#mute-claude"),
+  muteCodex: document.querySelector("#mute-codex"),
+  codexEnhanced: document.querySelector("#codex-enhanced"),
+  retentionDays: document.querySelector("#retention-days"),
+  claudeBridgeStatus: document.querySelector("#claude-bridge-status"),
+  claudeBridgeAction: document.querySelector("#claude-bridge-action"),
+  exportData: document.querySelector("#export-data"),
+  clearData: document.querySelector("#clear-data"),
+  notificationBanner: document.querySelector("#notification-banner"),
+  notificationKind: document.querySelector("#notification-kind"),
+  notificationTitle: document.querySelector("#notification-title"),
+  notificationView: document.querySelector("#notification-view"),
+  notificationClose: document.querySelector("#notification-close"),
 };
 
 let csrfToken = sessionStorage.getItem("flowAgentCsrf");
@@ -30,6 +51,18 @@ let undoCommandId;
 let toastTimer;
 let setupState = { providers: [], firstRun: false };
 let setupBusy = false;
+let settingsState = {
+  notificationRules: { approval: "banner", question: "banner", error: "banner", completion: "list" },
+  soundEnabled: true,
+  providerMuted: { claude: false, codex: false },
+  codexEnhancedActivity: false,
+  retentionDays: 90,
+};
+let claudeBridge = { status: "not_installed" };
+let settingsBusy = false;
+let notificationsPrimed = false;
+let knownAttentionIds = new Set();
+let notificationItemId;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -176,6 +209,161 @@ async function changeSetup(provider, action) {
   } finally {
     setupBusy = false;
     renderSetup();
+  }
+}
+
+function openSettings() {
+  ui.settingsOverlay.hidden = false;
+  ui.settingsClose.focus();
+  loadSettings();
+}
+
+function closeSettings() {
+  ui.settingsOverlay.hidden = true;
+  ui.settingsTrigger.focus();
+}
+
+function bridgeStatusCopy(status) {
+  return {
+    installed: "已开启 · 等待 Claude 下一次响应更新",
+    not_installed: "未开启",
+    helper_missing: "桥接文件缺失，可安全修复",
+    custom_conflict: "检测到你的自定义 status line，不会覆盖",
+    config_malformed: "Claude 配置无法解析，已停止修改",
+  }[status] || "状态暂时不可用";
+}
+
+function renderSettings() {
+  const rules = settingsState.notificationRules || {};
+  ui.notifyApproval.value = rules.approval || "banner";
+  ui.notifyQuestion.value = rules.question || "banner";
+  ui.notifyError.value = rules.error || "banner";
+  ui.notifyCompletion.value = rules.completion || "list";
+  ui.soundEnabled.checked = Boolean(settingsState.soundEnabled);
+  ui.muteClaude.checked = Boolean(settingsState.providerMuted?.claude);
+  ui.muteCodex.checked = Boolean(settingsState.providerMuted?.codex);
+  ui.codexEnhanced.checked = Boolean(settingsState.codexEnhancedActivity);
+  ui.retentionDays.value = String(settingsState.retentionDays || 90);
+  ui.claudeBridgeStatus.textContent = bridgeStatusCopy(claudeBridge.status);
+  const removable = claudeBridge.status === "installed";
+  const blocked = ["custom_conflict", "config_malformed"].includes(claudeBridge.status);
+  ui.claudeBridgeAction.textContent = removable ? "关闭" : claudeBridge.status === "helper_missing" ? "修复" : "开启";
+  ui.claudeBridgeAction.dataset.action = removable ? "uninstall" : "install";
+  ui.claudeBridgeAction.disabled = settingsBusy || blocked;
+}
+
+async function loadSettings() {
+  try {
+    const response = await api("/api/v1/settings");
+    settingsState = response.settings;
+    claudeBridge = response.claudeQuotaBridge;
+    renderSettings();
+  } catch (error) {
+    showToast(`设置读取失败：${error.message}`);
+  }
+}
+
+function settingsFromForm() {
+  return {
+    notificationRules: {
+      approval: ui.notifyApproval.value,
+      question: ui.notifyQuestion.value,
+      error: ui.notifyError.value,
+      completion: ui.notifyCompletion.value,
+    },
+    soundEnabled: ui.soundEnabled.checked,
+    providerMuted: { claude: ui.muteClaude.checked, codex: ui.muteCodex.checked },
+    codexEnhancedActivity: ui.codexEnhanced.checked,
+    retentionDays: Number(ui.retentionDays.value),
+  };
+}
+
+async function saveSettings() {
+  if (settingsBusy) return;
+  settingsBusy = true;
+  const previousCodexMode = settingsState.codexEnhancedActivity;
+  try {
+    const response = await api("/api/v1/settings", {
+      method: "PUT",
+      body: JSON.stringify(settingsFromForm()),
+    });
+    settingsState = response.settings;
+    claudeBridge = response.claudeQuotaBridge;
+    renderSettings();
+    if (previousCodexMode !== settingsState.codexEnhancedActivity) {
+      showToast("Codex Hook 已更新，请在 Codex 中运行 /hooks 重新检查信任");
+      loadSetup();
+    } else {
+      showToast("设置已保存到本机");
+    }
+  } catch (error) {
+    renderSettings();
+    showToast(`设置保存失败：${error.detail || error.message}`);
+  } finally {
+    settingsBusy = false;
+    renderSettings();
+  }
+}
+
+async function changeClaudeBridge() {
+  if (settingsBusy) return;
+  settingsBusy = true;
+  renderSettings();
+  const action = ui.claudeBridgeAction.dataset.action || "install";
+  try {
+    const response = await api("/api/v1/quota/claude-bridge", {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
+    settingsState = response.settings;
+    claudeBridge = response.claudeQuotaBridge;
+    await loadSnapshot();
+    showToast(action === "install" ? "Claude 额度桥已开启，完成一次对话后会显示额度" : "Claude 额度桥已关闭");
+  } catch (error) {
+    showToast(`额度桥操作失败：${error.detail || error.message}`);
+  } finally {
+    settingsBusy = false;
+    renderSettings();
+  }
+}
+
+async function exportLocalData() {
+  try {
+    const response = await fetch("/api/v1/export", { credentials: "same-origin" });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "flow-agent-export.json";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast("本地数据已导出");
+  } catch (error) {
+    showToast(`导出失败：${error.message}`);
+  }
+}
+
+async function clearLocalData() {
+  const confirmation = window.prompt("这会删除本地事件、会话、额度缓存和设置。请输入 DELETE 确认：");
+  if (confirmation !== "DELETE") {
+    if (confirmation !== null) showToast("输入不匹配，没有删除任何数据");
+    return;
+  }
+  try {
+    await api("/api/v1/data/clear", {
+      method: "POST",
+      body: JSON.stringify({ confirmation }),
+    });
+    notificationsPrimed = false;
+    knownAttentionIds = new Set();
+    await loadSnapshot();
+    await loadSettings();
+    showToast("本地运行数据已彻底清除，Hook 接入保持不变");
+  } catch (error) {
+    showToast(`清除失败：${error.detail || error.message}`);
   }
 }
 
@@ -343,27 +531,100 @@ function renderQuota() {
   if (!snapshot.quota.length) {
     const unavailable = element("div", "quota-unavailable");
     unavailable.append(element("strong", "", "暂无可靠额度数据"));
-    unavailable.append(element("p", "", "Flow Agent 不会用估算值冒充真实额度。采集桥接在后续里程碑接入。"));
+    unavailable.append(element("p", "", "额度来源尚未检查；Flow Agent 不会用估算值冒充真实额度。"));
     unavailable.append(element("div", "quota-track"));
     ui.quotaList.append(unavailable);
     return;
   }
   for (const quota of snapshot.quota) {
+    if (quota.status !== "available" || typeof quota.usedPct !== "number" || typeof quota.remainingPct !== "number") {
+      const unavailable = element("article", "quota-unavailable");
+      unavailable.append(element("strong", "", `${providerName(quota.provider)} · 暂无数据`));
+      unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
+      unavailable.append(element("div", "quota-track"));
+      if (quota.provider === "claude") {
+        const help = element("button", "quota-help", "如何开启");
+        help.type = "button";
+        help.addEventListener("click", openSettings);
+        unavailable.append(help);
+      }
+      ui.quotaList.append(unavailable);
+      continue;
+    }
     const row = element("article", "quota-row");
     const title = element("div", "row-title");
     title.append(element("strong", "", `${providerName(quota.provider)} · ${quota.window || "额度"}`));
-    if (typeof quota.usedPct === "number") title.append(element("span", "section-meta", `${Math.round(quota.usedPct)}%`));
+    title.append(element("span", "section-meta", `剩余 ${Math.round(quota.remainingPct)}%`));
     row.append(title);
     const track = element("div", "quota-track");
     const fill = element("div", "quota-fill");
-    fill.style.width = `${Math.max(0, Math.min(100, Number(quota.usedPct) || 0))}%`;
+    fill.style.width = `${Math.max(0, Math.min(100, quota.remainingPct))}%`;
+    fill.classList.add(quota.remainingPct >= 50 ? "healthy" : quota.remainingPct >= 20 ? "warning" : "critical");
     track.append(fill);
     row.append(track);
+    const meta = element("div", "quota-meta");
+    if (quota.resetsAt) {
+      const reset = new Date(Number(quota.resetsAt) * 1000);
+      meta.append(element("span", "", `${reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} 重置`));
+    }
+    if (quota.capturedAt) {
+      const minutes = Math.floor((Date.now() - Number(quota.capturedAt)) / 60000);
+      meta.append(element("span", "", minutes > 0 ? `${minutes} 分钟前更新` : "刚刚更新"));
+    }
+    row.append(meta);
     ui.quotaList.append(row);
   }
 }
 
+function notificationRule(item) {
+  return settingsState.notificationRules?.[item.kind] || "list";
+}
+
+function isProviderMuted(provider) {
+  return Boolean(settingsState.providerMuted?.[provider]);
+}
+
+function playNotificationSound() {
+  if (!settingsState.soundEnabled) return;
+  try {
+    const AudioContextType = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextType) return;
+    const context = new AudioContextType();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.frequency.value = 660;
+    gain.gain.setValueAtTime(0.0001, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.12);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.13);
+    oscillator.addEventListener("ended", () => context.close());
+  } catch (_) {
+    // Browsers may require a user gesture before audio; the banner still works.
+  }
+}
+
+function showNotification(item) {
+  notificationItemId = item.id;
+  ui.notificationKind.textContent = `${providerName(item.provider)} · ${item.kind === "approval" ? "等待批准" : stateLabel(item.kind)}`;
+  ui.notificationTitle.textContent = attentionTitle(item);
+  ui.notificationBanner.hidden = false;
+  playNotificationSound();
+}
+
+function processNotifications(nextSnapshot) {
+  const nextItems = (nextSnapshot.attention || []).filter((item) => ["open", "committing", "decision_sent"].includes(item.state));
+  if (notificationsPrimed) {
+    const item = nextItems.find((candidate) => !knownAttentionIds.has(candidate.id));
+    if (item && notificationRule(item) === "banner" && !isProviderMuted(item.provider)) showNotification(item);
+  }
+  knownAttentionIds = new Set(nextItems.map((item) => item.id));
+}
+
 function render(nextSnapshot) {
+  processNotifications(nextSnapshot);
   snapshot = nextSnapshot;
   renderAttention();
   renderSessions();
@@ -493,8 +754,40 @@ ui.setupRefresh.addEventListener("click", loadSetup);
 ui.setupOverlay.addEventListener("click", (event) => {
   if (event.target === ui.setupOverlay) closeSetup();
 });
+ui.settingsTrigger.addEventListener("click", openSettings);
+ui.settingsClose.addEventListener("click", closeSettings);
+ui.settingsOverlay.addEventListener("click", (event) => {
+  if (event.target === ui.settingsOverlay) closeSettings();
+});
+for (const control of [
+  ui.notifyApproval,
+  ui.notifyQuestion,
+  ui.notifyError,
+  ui.notifyCompletion,
+  ui.soundEnabled,
+  ui.muteClaude,
+  ui.muteCodex,
+  ui.codexEnhanced,
+  ui.retentionDays,
+]) {
+  control.addEventListener("change", saveSettings);
+}
+ui.claudeBridgeAction.addEventListener("click", changeClaudeBridge);
+ui.exportData.addEventListener("click", exportLocalData);
+ui.clearData.addEventListener("click", clearLocalData);
+ui.notificationClose.addEventListener("click", () => { ui.notificationBanner.hidden = true; });
+ui.notificationView.addEventListener("click", () => {
+  const items = openItems();
+  const index = items.findIndex((item) => item.id === notificationItemId);
+  if (index >= 0) currentAttention = index;
+  renderAttention();
+  ui.notificationBanner.hidden = true;
+  document.querySelector("#attention-heading").focus?.();
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !ui.setupOverlay.hidden) closeSetup();
+  if (event.key !== "Escape") return;
+  if (!ui.setupOverlay.hidden) closeSetup();
+  if (!ui.settingsOverlay.hidden) closeSettings();
 });
 
 (async () => {
@@ -502,6 +795,9 @@ document.addEventListener("keydown", (event) => {
   try {
     await loadSnapshot();
     await loadSetup();
+    await loadSettings();
+    knownAttentionIds = new Set(openItems().map((item) => item.id));
+    notificationsPrimed = true;
     connectSocket();
   } catch (error) {
     ui.attentionList.replaceChildren(emptyState("!", "无法连接本地 Runtime", "请从 flow-agent serve 输出的一次性地址打开控制面板。"));

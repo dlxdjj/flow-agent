@@ -1,30 +1,37 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use flow_agent_installer::{
-    BinaryHealth, CodexTrustStatus, ConfigHealth, HookProvider, InstallOptions, InstallPaths,
-    Installer,
+    BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus, ConfigHealth, HookProvider,
+    InstallIntent, InstallOptions, InstallPaths, Installer,
 };
+use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
-    ApprovalAction, AttentionAction, CommandState, RuntimeStore, StoreError, WaiterRegistry,
+    ApprovalAction, AttentionAction, CommandState, QuotaRecord, RuntimeStore, StoreError,
+    WaiterRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path as FilePath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "flow_agent_session";
 const CSRF_HEADER: &str = "x-flow-agent-csrf";
+const SETTINGS_KEY: &str = "ui_settings";
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
 const APP_JS: &str = include_str!("../../../web/app.js");
@@ -34,6 +41,8 @@ pub struct ApiServerConfig {
     pub bind: SocketAddr,
     pub commit_delay: Duration,
     pub snapshot_interval: Duration,
+    pub quota_poll_interval: Duration,
+    pub install_paths: Option<InstallPaths>,
 }
 
 impl Default for ApiServerConfig {
@@ -42,6 +51,8 @@ impl Default for ApiServerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
+            quota_poll_interval: Duration::from_secs(5 * 60),
+            install_paths: None,
         }
     }
 }
@@ -79,10 +90,25 @@ impl ApiServer {
             )));
         }
         let bootstrap_token = Uuid::now_v7().to_string();
-        let install_paths =
-            InstallPaths::discover().map_err(|error| ApiServerError::Setup(error.to_string()))?;
+        let install_paths = match config.install_paths.clone() {
+            Some(paths) => paths,
+            None => InstallPaths::discover()
+                .map_err(|error| ApiServerError::Setup(error.to_string()))?,
+        };
         let source_binary =
             std::env::current_exe().map_err(|error| ApiServerError::Setup(error.to_string()))?;
+        let quota_paths = QuotaPaths {
+            flow_home: install_paths.flow_home.clone(),
+            codex_sessions: install_paths
+                .codex_config
+                .parent()
+                .unwrap_or_else(|| FilePath::new("."))
+                .join("sessions"),
+        };
+        let data_paths = DataPaths {
+            cache: install_paths.flow_home.join("cache"),
+            spool: install_paths.flow_home.join("spool"),
+        };
         let state = AppState {
             store,
             waiters,
@@ -95,7 +121,14 @@ impl ApiServer {
             expected_origin: format!("http://{address}"),
             commit_delay: config.commit_delay,
             snapshot_interval: config.snapshot_interval,
+            quota_poll_interval: config.quota_poll_interval,
             installer: Arc::new(Installer::new(install_paths, source_binary)),
+            quota: Arc::new(Mutex::new(QuotaState {
+                collector: QuotaCollector::new(quota_paths),
+                entries: Vec::new(),
+                refreshed_at: None,
+            })),
+            data_paths,
         };
         let router = router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -163,7 +196,22 @@ struct AppState {
     expected_origin: String,
     commit_delay: Duration,
     snapshot_interval: Duration,
+    quota_poll_interval: Duration,
     installer: Arc<Installer>,
+    quota: Arc<Mutex<QuotaState>>,
+    data_paths: DataPaths,
+}
+
+struct QuotaState {
+    collector: QuotaCollector,
+    entries: Vec<QuotaEntry>,
+    refreshed_at: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct DataPaths {
+    cache: PathBuf,
+    spool: PathBuf,
 }
 
 struct AuthState {
@@ -181,6 +229,10 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/bootstrap", post(bootstrap))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/setup", get(setup).post(change_setup))
+        .route("/api/v1/settings", get(settings).put(update_settings))
+        .route("/api/v1/quota/claude-bridge", post(change_claude_bridge))
+        .route("/api/v1/export", get(export_data))
+        .route("/api/v1/data/clear", post(clear_data))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/commands/{id}/undo", post(undo))
         .route("/api/v1/ws", get(websocket))
@@ -292,8 +344,6 @@ async fn setup(State(state): State<AppState>, headers: HeaderMap) -> Response {
 struct SetupChangeRequest {
     provider: String,
     action: String,
-    #[serde(default)]
-    enhanced_codex_activity: bool,
 }
 
 async fn change_setup(
@@ -312,8 +362,22 @@ async fn change_setup(
     if request.action != "uninstall" && !provider_cli_available(provider) {
         return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
     }
+    let enhanced_codex_activity = if provider == HookProvider::Codex {
+        match load_ui_settings(&state) {
+            Ok(settings) => settings.codex_enhanced_activity,
+            Err(error) => {
+                return api_error_detail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "SETTINGS_READ_FAILED",
+                    &error.to_string(),
+                )
+            }
+        }
+    } else {
+        false
+    };
     let options = InstallOptions {
-        enhanced_codex_activity: request.enhanced_codex_activity,
+        enhanced_codex_activity,
     };
     let changed = match request.action.as_str() {
         "install" => state.installer.install(provider, options).map(|_| ()),
@@ -434,6 +498,307 @@ fn provider_cli_available(provider: HookProvider) -> bool {
                 .unwrap_or(false)
         })
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UiSettings {
+    notification_rules: NotificationRules,
+    sound_enabled: bool,
+    provider_muted: ProviderMuted,
+    codex_enhanced_activity: bool,
+    retention_days: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NotificationRules {
+    approval: String,
+    question: String,
+    error: String,
+    completion: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderMuted {
+    claude: bool,
+    codex: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            notification_rules: NotificationRules {
+                approval: "banner".to_owned(),
+                question: "banner".to_owned(),
+                error: "banner".to_owned(),
+                completion: "list".to_owned(),
+            },
+            sound_enabled: true,
+            provider_muted: ProviderMuted {
+                claude: false,
+                codex: false,
+            },
+            codex_enhanced_activity: false,
+            retention_days: 90,
+        }
+    }
+}
+
+impl UiSettings {
+    fn validate(&self) -> Result<(), &'static str> {
+        for mode in [
+            self.notification_rules.approval.as_str(),
+            self.notification_rules.question.as_str(),
+            self.notification_rules.error.as_str(),
+            self.notification_rules.completion.as_str(),
+        ] {
+            if !matches!(mode, "banner" | "list" | "ignore") {
+                return Err("notification mode must be banner, list, or ignore");
+            }
+        }
+        if !matches!(self.retention_days, 30 | 90 | 365) {
+            return Err("retentionDays must be 30, 90, or 365");
+        }
+        Ok(())
+    }
+}
+
+async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    settings_value(&state)
+        .map(Json)
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETTINGS_READ_FAILED",
+                &error,
+            )
+        })
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(next): Json<UiSettings>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if let Err(reason) = next.validate() {
+        return api_error_detail(StatusCode::BAD_REQUEST, "INVALID_SETTINGS", reason);
+    }
+    let current = match load_ui_settings(&state) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETTINGS_READ_FAILED",
+                &error.to_string(),
+            )
+        }
+    };
+    if current.codex_enhanced_activity != next.codex_enhanced_activity {
+        let inspection = match state.installer.inspect(HookProvider::Codex) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                return api_error_detail(
+                    StatusCode::CONFLICT,
+                    "CODEX_REINSTALL_FAILED",
+                    &error.to_string(),
+                )
+            }
+        };
+        if inspection.intent == InstallIntent::Installed {
+            if !provider_cli_available(HookProvider::Codex) {
+                return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+            }
+            if let Err(error) = state.installer.install(
+                HookProvider::Codex,
+                InstallOptions {
+                    enhanced_codex_activity: next.codex_enhanced_activity,
+                },
+            ) {
+                return api_error_detail(
+                    StatusCode::CONFLICT,
+                    "CODEX_REINSTALL_FAILED",
+                    &error.to_string(),
+                );
+            }
+        }
+    }
+    let encoded = match serde_json::to_string(&next) {
+        Ok(encoded) => encoded,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "INVALID_SETTINGS"),
+    };
+    if state.store.write_setting(SETTINGS_KEY, encoded).is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR");
+    }
+    if state
+        .store
+        .prune_events(next.retention_days, now_millis())
+        .is_err()
+    {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "RETENTION_FAILED");
+    }
+    settings_value(&state)
+        .map(Json)
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETTINGS_READ_FAILED",
+                &error,
+            )
+        })
+}
+
+fn load_ui_settings(state: &AppState) -> Result<UiSettings, StoreError> {
+    match state.store.read_setting(SETTINGS_KEY)? {
+        Some(value) => serde_json::from_str::<UiSettings>(&value)
+            .map_err(|error| StoreError::Storage(format!("settings JSON is invalid: {error}"))),
+        None => Ok(UiSettings::default()),
+    }
+}
+
+fn settings_value(state: &AppState) -> Result<Value, String> {
+    let settings = load_ui_settings(state).map_err(|error| error.to_string())?;
+    let bridge = state
+        .installer
+        .inspect_claude_statusline()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "settings": settings,
+        "claudeQuotaBridge": {
+            "status": bridge.status,
+            "configPath": bridge.config_path,
+            "helperPath": bridge.helper_path,
+            "customConflict": bridge.status == ClaudeStatuslineStatus::CustomConflict,
+        }
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeChangeRequest {
+    action: String,
+}
+
+async fn change_claude_bridge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BridgeChangeRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if request.action == "install" && !provider_cli_available(HookProvider::Claude) {
+        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+    }
+    let result = match request.action.as_str() {
+        "install" => state.installer.install_claude_statusline().map(|_| ()),
+        "uninstall" => state.installer.uninstall_claude_statusline().map(|_| ()),
+        _ => return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_BRIDGE_ACTION"),
+    };
+    if let Err(error) = result {
+        return api_error_detail(
+            StatusCode::CONFLICT,
+            "CLAUDE_BRIDGE_CHANGE_FAILED",
+            &error.to_string(),
+        );
+    }
+    invalidate_quota(&state);
+    settings_value(&state)
+        .map(Json)
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|error| {
+            api_error_detail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETTINGS_READ_FAILED",
+                &error,
+            )
+        })
+}
+
+async fn export_data(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED");
+    }
+    let export = match state.store.export_json(now_millis()) {
+        Ok(export) => export,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPORT_FAILED"),
+    };
+    let body = match serde_json::to_vec_pretty(&export) {
+        Ok(body) => body,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "EXPORT_FAILED"),
+    };
+    (
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=flow-agent-export.json"),
+            ),
+            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ClearDataRequest {
+    confirmation: String,
+}
+
+async fn clear_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClearDataRequest>,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    if request.confirmation != "DELETE" {
+        return api_error(StatusCode::BAD_REQUEST, "DELETE_CONFIRMATION_REQUIRED");
+    }
+    for path in [&state.data_paths.cache, &state.data_paths.spool] {
+        if let Err(error) = removable_owned_tree(path) {
+            return api_error_detail(StatusCode::CONFLICT, "UNSAFE_DATA_PATH", &error);
+        }
+    }
+    if state.store.clear_data().is_err() {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "CLEAR_FAILED");
+    }
+    for path in [&state.data_paths.cache, &state.data_paths.spool] {
+        if path.exists() && fs::remove_dir_all(path).is_err() {
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "CLEAR_FAILED");
+        }
+    }
+    invalidate_quota(&state);
+    Json(json!({ "cleared": true })).into_response()
+}
+
+fn removable_owned_tree(path: &FilePath) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("refusing symbolic link {}", path.display()))
+        }
+        Ok(metadata) if !metadata.is_dir() => Err(format!("{} is not a directory", path.display())),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn invalidate_quota(state: &AppState) {
+    if let Ok(mut quota) = state.quota.lock() {
+        quota.entries.clear();
+        quota.refreshed_at = None;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,13 +1011,44 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     let snapshot = state.store.snapshot()?;
+    let quota = quota_entries(state)?;
     Ok(json!({
         "sessions": snapshot.sessions,
         "attention": snapshot.attention,
         "commands": snapshot.commands,
-        "quota": [],
+        "quota": quota,
         "stats": { "eventCount": snapshot.event_count }
     }))
+}
+
+fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
+    let mut quota = state
+        .quota
+        .lock()
+        .map_err(|_| StoreError::Storage("quota collector lock is poisoned".to_owned()))?;
+    let refresh = quota
+        .refreshed_at
+        .is_none_or(|instant| instant.elapsed() >= state.quota_poll_interval);
+    if refresh {
+        quota.entries = quota.collector.collect(now_millis());
+        quota.refreshed_at = Some(Instant::now());
+        let persisted = quota
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                Some(QuotaRecord {
+                    provider: entry.provider.clone(),
+                    window: entry.window.clone(),
+                    used_pct: entry.used_pct?,
+                    resets_at: entry.resets_at?,
+                    source: entry.source.clone(),
+                    captured_at: entry.captured_at?,
+                })
+            })
+            .collect();
+        state.store.replace_quota_snapshots(persisted)?;
+    }
+    Ok(quota.entries.clone())
 }
 
 fn command_response(status: StatusCode, id: Uuid, state: CommandState) -> Response {
@@ -755,17 +1151,36 @@ mod tests {
     use std::fs;
     use tower::ServiceExt;
 
-    fn test_state(store: RuntimeStore) -> AppState {
-        let root = std::env::temp_dir().join(format!(
-            "flow-agent-server-installer-{}-{}",
-            std::process::id(),
-            Uuid::now_v7()
-        ));
+    fn authorized_request(method: &str, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(HOST, "127.0.0.1:43111")
+            .header(ORIGIN, "http://127.0.0.1:43111")
+            .header(COOKIE, "flow_agent_session=test-session")
+            .header(CSRF_HEADER, "test-csrf")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn json_body(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn test_state(store: RuntimeStore, root: &FilePath) -> AppState {
         let paths = InstallPaths {
             flow_home: root.join("flow-home"),
             claude_settings: root.join("home/.claude/settings.json"),
             codex_hooks: root.join("codex/hooks.json"),
             codex_config: root.join("codex/config.toml"),
+        };
+        let quota_paths = QuotaPaths {
+            flow_home: paths.flow_home.clone(),
+            codex_sessions: root.join("codex/sessions"),
         };
         AppState {
             store,
@@ -779,7 +1194,17 @@ mod tests {
             expected_origin: "http://127.0.0.1:43111".to_owned(),
             commit_delay: Duration::from_secs(3),
             snapshot_interval: Duration::from_millis(250),
+            quota_poll_interval: Duration::from_secs(300),
             installer: Arc::new(Installer::new(paths, std::env::current_exe().unwrap())),
+            quota: Arc::new(Mutex::new(QuotaState {
+                collector: QuotaCollector::new(quota_paths),
+                entries: Vec::new(),
+                refreshed_at: None,
+            })),
+            data_paths: DataPaths {
+                cache: root.join("flow-home/cache"),
+                spool: root.join("flow-home/spool"),
+            },
         }
     }
 
@@ -796,7 +1221,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let app = router(test_state(store));
+            let app = router(test_state(store, &root));
             let unauthorized = app
                 .clone()
                 .oneshot(
@@ -910,6 +1335,196 @@ mod tests {
                 .unwrap();
             assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
         });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn m4_settings_quota_export_and_clear_follow_the_authenticated_ui_path() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-m4-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        let claude_settings = state.installer.paths().claude_settings.clone();
+        fs::create_dir_all(claude_settings.parent().unwrap()).unwrap();
+        fs::write(
+            &claude_settings,
+            br#"{"statusLine":{"type":"command","command":"~/.claude/custom.sh"},"keep":true}"#,
+        )
+        .unwrap();
+        let cache = state.quota.lock().unwrap().collector.paths().claude_cache();
+        flow_agent_quota::capture_claude_statusline(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":25,"resets_at":1784140000}}}"#,
+            &cache,
+            now_millis(),
+        )
+        .unwrap();
+        fs::create_dir_all(&state.data_paths.spool).unwrap();
+        fs::write(state.data_paths.spool.join("offline.json"), b"sanitized").unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let app = router(state.clone());
+            let settings_update = json!({
+                "notificationRules": {
+                    "approval":"list", "question":"banner", "error":"ignore", "completion":"banner"
+                },
+                "soundEnabled": false,
+                "providerMuted": {"claude": true, "codex": false},
+                "codexEnhancedActivity": true,
+                "retentionDays": 30
+            });
+            let updated = app
+                .clone()
+                .oneshot(authorized_request(
+                    "PUT",
+                    "/api/v1/settings",
+                    settings_update,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(updated.status(), StatusCode::OK);
+            let updated = json_body(updated).await;
+            assert_eq!(updated["settings"]["retentionDays"], 30);
+            assert_eq!(updated["settings"]["notificationRules"]["approval"], "list");
+            assert_eq!(updated["claudeQuotaBridge"]["status"], "custom_conflict");
+
+            let snapshot = app
+                .clone()
+                .oneshot(authorized_request("GET", "/api/v1/snapshot", Value::Null))
+                .await
+                .unwrap();
+            assert_eq!(snapshot.status(), StatusCode::OK);
+            let snapshot = json_body(snapshot).await;
+            let claude = snapshot["quota"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["provider"] == "claude")
+                .unwrap();
+            assert_eq!(claude["status"], "available");
+            assert_eq!(claude["remainingPct"], 75.0);
+
+            let bridge = app
+                .clone()
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/quota/claude-bridge",
+                    json!({"action":"install"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(bridge.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(&claude_settings).unwrap()).unwrap()
+                    ["keep"],
+                true
+            );
+
+            let exported = app
+                .clone()
+                .oneshot(authorized_request("GET", "/api/v1/export", Value::Null))
+                .await
+                .unwrap();
+            assert_eq!(exported.status(), StatusCode::OK);
+            assert_eq!(
+                exported.headers()[CONTENT_DISPOSITION],
+                "attachment; filename=flow-agent-export.json"
+            );
+            let exported = json_body(exported).await;
+            assert_eq!(exported["tables"]["settings"].as_array().unwrap().len(), 1);
+
+            let wrong_confirmation = app
+                .clone()
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/data/clear",
+                    json!({"confirmation":"delete"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(wrong_confirmation.status(), StatusCode::BAD_REQUEST);
+            assert!(cache.exists());
+
+            let cleared = app
+                .oneshot(authorized_request(
+                    "POST",
+                    "/api/v1/data/clear",
+                    json!({"confirmation":"DELETE"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(cleared.status(), StatusCode::OK);
+        });
+        assert!(store.snapshot().unwrap().sessions.is_empty());
+        assert_eq!(store.read_setting(SETTINGS_KEY).unwrap(), None);
+        assert!(!state.data_paths.cache.exists());
+        assert!(!state.data_paths.spool.exists());
+        assert!(claude_settings.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_settings_block_reconfiguration_before_provider_files_are_touched() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-m4-corrupt-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let state = test_state(store.clone(), &root);
+        {
+            let mut auth = state.auth.lock().unwrap();
+            auth.bootstrap_token = None;
+            auth.session_token = Some("test-session".to_owned());
+            auth.csrf_token = Some("test-csrf".to_owned());
+        }
+        let hooks = state.installer.paths().codex_hooks.clone();
+        fs::create_dir_all(hooks.parent().unwrap()).unwrap();
+        fs::write(&hooks, b"provider file must stay unchanged").unwrap();
+        store
+            .write_setting(SETTINGS_KEY, "{broken-json".to_owned())
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = router(state)
+                .oneshot(authorized_request(
+                    "PUT",
+                    "/api/v1/settings",
+                    json!({
+                        "notificationRules": {
+                            "approval":"banner", "question":"banner",
+                            "error":"banner", "completion":"banner"
+                        },
+                        "soundEnabled": true,
+                        "providerMuted": {"claude": false, "codex": false},
+                        "codexEnhancedActivity": true,
+                        "retentionDays": 90
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        assert_eq!(
+            fs::read(&hooks).unwrap(),
+            b"provider file must stay unchanged"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

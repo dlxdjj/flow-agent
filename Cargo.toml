@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/installer",
     "crates/providers",
+    "crates/quota",
     "crates/runtime",
     "crates/server",
 ]

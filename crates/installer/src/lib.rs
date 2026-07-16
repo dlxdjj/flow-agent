@@ -109,6 +109,10 @@ impl InstallPaths {
         self.flow_home.join("bin/flow-agent")
     }
 
+    pub fn statusline_helper(&self) -> PathBuf {
+        self.flow_home.join("bin/statusline")
+    }
+
     pub fn state_file(&self) -> PathBuf {
         self.flow_home.join("install-state.json")
     }
@@ -135,6 +139,25 @@ pub struct RepairReport {
     pub attempted: bool,
     pub skipped_reason: Option<String>,
     pub result: Option<InstallReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeStatuslineStatus {
+    NotInstalled,
+    Installed,
+    HelperMissing,
+    CustomConflict,
+    ConfigMalformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeStatuslineInspection {
+    pub status: ClaudeStatuslineStatus,
+    pub config_path: PathBuf,
+    pub helper_path: PathBuf,
+    pub config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -220,6 +243,8 @@ pub enum InstallerError {
     },
     #[error("Codex inline hook definitions conflict with hooks.json: {events:?}")]
     CodexInlineHooksConflict { events: Vec<String> },
+    #[error("Claude already has a custom statusLine; Flow Agent will not replace it")]
+    ClaudeStatuslineConflict,
     #[error("installer lock failed: {0}")]
     Lock(io::Error),
     #[error("I/O failed for {path}: {source}")]
@@ -357,6 +382,126 @@ impl Installer {
         })
     }
 
+    pub fn inspect_claude_statusline(&self) -> Result<ClaudeStatuslineInspection, InstallerError> {
+        let config_path = self.paths.claude_settings.clone();
+        let helper_path = self.paths.statusline_helper();
+        let (health, config_error, config) = inspect_json_config(&config_path)?;
+        let status = match health {
+            ConfigHealth::Malformed => ClaudeStatuslineStatus::ConfigMalformed,
+            ConfigHealth::Missing => ClaudeStatuslineStatus::NotInstalled,
+            ConfigHealth::Valid => {
+                let configured = config.as_ref().and_then(|value| value.get("statusLine"));
+                if configured.is_none() {
+                    ClaudeStatuslineStatus::NotInstalled
+                } else if configured == Some(&self.managed_statusline_value()) {
+                    if inspect_binary(&helper_path)? == BinaryHealth::Executable
+                        && inspect_binary(&self.paths.stable_binary())? == BinaryHealth::Executable
+                    {
+                        ClaudeStatuslineStatus::Installed
+                    } else {
+                        ClaudeStatuslineStatus::HelperMissing
+                    }
+                } else {
+                    ClaudeStatuslineStatus::CustomConflict
+                }
+            }
+        };
+        Ok(ClaudeStatuslineInspection {
+            status,
+            config_path,
+            helper_path,
+            config_error,
+        })
+    }
+
+    pub fn install_claude_statusline(&self) -> Result<InstallReport, InstallerError> {
+        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        self.validate_source_binary()?;
+        let config_path = self.paths.claude_settings.clone();
+        let (original, existed) = self.load_provider_json(&config_path)?;
+        if original
+            .get("statusLine")
+            .is_some_and(|value| value != &self.managed_statusline_value())
+        {
+            return Err(InstallerError::ClaudeStatuslineConflict);
+        }
+        let mut updated = original.clone();
+        updated
+            .as_object_mut()
+            .expect("validated provider configuration")
+            .insert("statusLine".to_owned(), self.managed_statusline_value());
+        let config_changed = updated != original;
+        let backup_path = if config_changed && existed {
+            Some(self.backup_file(&config_path)?)
+        } else {
+            None
+        };
+        let binary_changed = self.install_stable_binary()?;
+        let wrapper = format!(
+            "#!/bin/sh\nexec {} statusline\n",
+            shell_quote(&self.paths.stable_binary())
+        );
+        atomic_write(&self.paths.statusline_helper(), wrapper.as_bytes(), 0o700)?;
+        if config_changed {
+            atomic_write_json(&config_path, &updated, 0o600)?;
+        }
+        Ok(InstallReport {
+            provider: HookProvider::Claude,
+            intent: InstallIntent::Installed,
+            config_path,
+            stable_binary: self.paths.statusline_helper(),
+            config_changed,
+            binary_changed,
+            backup_path,
+            definition_hash: None,
+        })
+    }
+
+    pub fn uninstall_claude_statusline(&self) -> Result<InstallReport, InstallerError> {
+        let _lock = InstallLock::acquire(&self.paths.flow_home)?;
+        let config_path = self.paths.claude_settings.clone();
+        let (original, existed) = self.load_provider_json(&config_path)?;
+        let mut updated = original.clone();
+        let owns_entry = original.get("statusLine") == Some(&self.managed_statusline_value());
+        if owns_entry {
+            updated
+                .as_object_mut()
+                .expect("validated provider configuration")
+                .remove("statusLine");
+        }
+        let config_changed = existed && updated != original;
+        let backup_path = if config_changed {
+            Some(self.backup_file(&config_path)?)
+        } else {
+            None
+        };
+        if config_changed {
+            atomic_write_json(&config_path, &updated, 0o600)?;
+        }
+        let mut binary_changed = false;
+        if owns_entry {
+            binary_changed |= remove_regular_file(&self.paths.statusline_helper())?;
+            let state = self.load_state()?;
+            let hooks_installed = state
+                .providers
+                .values()
+                .any(|provider| provider.intent == InstallIntent::Installed);
+            if !hooks_installed {
+                binary_changed |= self.remove_stable_binary()?;
+            }
+        }
+        Ok(InstallReport {
+            provider: HookProvider::Claude,
+            intent: InstallIntent::Uninstalled,
+            config_path,
+            stable_binary: self.paths.statusline_helper(),
+            config_changed,
+            binary_changed,
+            backup_path,
+            definition_hash: None,
+        })
+    }
+
     pub fn install(
         &self,
         provider: HookProvider,
@@ -472,7 +617,11 @@ impl Installer {
             .providers
             .values()
             .any(|provider_state| provider_state.intent == InstallIntent::Installed);
-        let binary_changed = if any_installed {
+        let statusline_installed = self
+            .inspect_claude_statusline()
+            .map(|inspection| inspection.status == ClaudeStatuslineStatus::Installed)
+            .unwrap_or(false);
+        let binary_changed = if any_installed || statusline_installed {
             false
         } else {
             self.remove_stable_binary()?
@@ -539,6 +688,16 @@ impl Installer {
             shell_quote(&self.paths.stable_binary()),
             provider.as_str()
         )
+    }
+
+    fn managed_statusline_value(&self) -> Value {
+        let mut value = Map::new();
+        value.insert("type".to_owned(), Value::String("command".to_owned()));
+        value.insert(
+            "command".to_owned(),
+            Value::String(shell_quote(&self.paths.statusline_helper())),
+        );
+        Value::Object(value)
     }
 
     fn validate_source_binary(&self) -> Result<(), InstallerError> {
@@ -1180,6 +1339,28 @@ fn regular_files_equal(left: &Path, right: &Path) -> Result<bool, InstallerError
         return Ok(false);
     }
     Ok(read_bounded(left, u64::MAX)? == read_bounded(right, u64::MAX)?)
+}
+
+fn remove_regular_file(path: &Path) -> Result<bool, InstallerError> {
+    refuse_symlink(path)?;
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(path).map_err(|source| InstallerError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(true)
+        }
+        Ok(_) => Err(InstallerError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "path is not a regular file"),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(InstallerError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn atomic_write_json(path: &Path, value: &impl Serialize, mode: u32) -> Result<(), InstallerError> {

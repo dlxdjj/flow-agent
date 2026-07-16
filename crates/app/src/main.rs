@@ -9,6 +9,7 @@ use flow_agent_installer::{
     BinaryHealth, CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
     InstallOptions, InstallPaths, Installer,
 };
+use flow_agent_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
 use flow_agent_runtime::{
     default_database_path, ApprovalAction, EventSpool, RuntimeInstanceGuard, RuntimeStore,
     WaiterRegistry,
@@ -79,6 +80,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export all locally persisted, sanitized Flow Agent data as JSON.
+    Export,
+    /// Claude Code status line bridge. Installed and invoked by Flow Agent.
+    #[command(hide = true)]
+    Statusline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -141,7 +147,35 @@ fn main() -> Result<()> {
         } => install_hooks(provider, enhanced_codex_activity, repair),
         Command::UninstallHooks { provider } => uninstall_hooks(provider),
         Command::Doctor { json } => doctor(json),
+        Command::Export => export_local_data(),
+        Command::Statusline => run_statusline(),
     }
+}
+
+fn export_local_data() -> Result<()> {
+    let store = RuntimeStore::open(default_database_path()).context("failed to open local data")?;
+    let export = store
+        .export_json(now_millis())
+        .context("failed to export local data")?;
+    println!("{}", serde_json::to_string_pretty(&export)?);
+    Ok(())
+}
+
+fn run_statusline() -> Result<()> {
+    let mut input = Vec::new();
+    let _ = io::stdin()
+        .take((MAX_HOOK_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut input);
+    if input.len() > MAX_HOOK_PAYLOAD_BYTES {
+        println!("Flow Agent · 额度输入过大");
+        return Ok(());
+    }
+    let paths = QuotaPaths::discover();
+    match capture_claude_statusline(&input, &paths.claude_cache(), now_millis()) {
+        Ok(entries) => println!("{}", statusline_text(&entries)),
+        Err(_) => println!("Flow Agent · 额度暂不可用"),
+    }
+    Ok(())
 }
 
 fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool) -> Result<()> {
@@ -960,6 +994,18 @@ fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()>
         .with_context(|| format!("failed to acquire {}", paths.lock.display()))?;
     let store = RuntimeStore::open(&paths.database)
         .with_context(|| format!("failed to open {}", paths.database.display()))?;
+    let retention_days = store
+        .read_setting("ui_settings")
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|value| value.get("retentionDays").and_then(Value::as_u64))
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| matches!(value, 30 | 90 | 365))
+        .unwrap_or(90);
+    store
+        .prune_events(retention_days, now_millis())
+        .context("failed to apply event retention")?;
     store
         .reconcile_orphaned_approvals(Vec::new(), now_millis())
         .context("failed to reconcile stale approvals")?;

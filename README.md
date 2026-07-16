@@ -2,15 +2,17 @@
 
 Local-first attention surface for coding agents.
 
-The repository is under active v1 development. M3 provides the fail-open Hook
+The repository is under active v1 development. M4 provides the fail-open Hook
 bridge, persistent single-instance Runtime, authenticated localhost control
 panel, fixed three-module web UI, safe Claude/Codex installer, first-run
-onboarding, and structured diagnostics:
+onboarding, structured diagnostics, honest quota adapters, notification
+settings, retention, export, and destructive local-data clearing:
 
 ```bash
 cargo run -p flow-agent -- serve --open
 cargo run -p flow-agent -- install-hooks all
 cargo run -p flow-agent -- doctor
+cargo run -p flow-agent -- export
 cargo run -p flow-agent -- hook --provider claude < fixture.json
 ```
 
@@ -39,6 +41,14 @@ The onboarding UI uses the same installer implementation. It does not show
 "connected" until a real provider event arrives after installation. Doctor and
 automated tests do not modify the user's real Claude or Codex configuration.
 
+The settings panel can opt into the Claude status-line quota bridge. Flow Agent
+refuses to replace any existing custom `statusLine`. Codex quota parsing is
+read-only, accepts only the fixture-verified 0.144.4 rollout schema, and renders
+unknown, missing, or data older than 30 minutes as unavailable without a
+percentage. Local export contains the sanitized SQLite tables; destructive
+clear requires the exact confirmation `DELETE` and preserves Hook integration
+and backups.
+
 ## v1 plan
 
 - [Full v1.1 implementation plan](docs/WIDGET_V1_PLAN.md)
@@ -48,6 +58,7 @@ automated tests do not modify the user's real Claude or Codex configuration.
 - [M1 verification record](docs/M1_VERIFICATION.md)
 - [M2 verification record](docs/M2_VERIFICATION.md)
 - [M3 verification record](docs/M3_VERIFICATION.md)
+- [M4 verification record](docs/M4_VERIFICATION.md)
 
 ## Local quality gate
 
@@ -62,7 +73,8 @@ cargo build --workspace --release --offline
 The common suite covers the provider path, SQLite Runtime, waiter, spool,
 single-instance, restart, duplicate-request, authenticated API, UI contract,
 safe install/uninstall, tri-state repair, onboarding, trust inspection, factual
-task progress, and half-close behavior. The E2E suites verify provider
+task progress, quota degradation, settings/data management, and half-close
+behavior. The E2E suites verify provider
 directives, widget control, pass-through, silent fail-open behavior when the
 Runtime is absent, and the post-install real-event verification boundary.
 

@@ -164,6 +164,12 @@ fn start(name: &str) -> (PathBuf, RuntimeStore, WaiterRegistry, ApiServer) {
         ApiServerConfig {
             commit_delay: Duration::from_millis(60),
             snapshot_interval: Duration::from_millis(20),
+            install_paths: Some(flow_agent_installer::InstallPaths {
+                flow_home: root.join("flow-home"),
+                claude_settings: root.join("home/.claude/settings.json"),
+                codex_hooks: root.join("home/.codex/hooks.json"),
+                codex_config: root.join("home/.codex/config.toml"),
+            }),
             ..ApiServerConfig::default()
         },
     )
@@ -210,6 +216,12 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(!INDEX_HTML.contains('$'));
     assert!(APP_JS.contains("暂无可靠额度数据"));
     assert!(APP_JS.contains("不会用估算值冒充真实额度"));
+    assert!(APP_JS.contains("quota.status !== \"available\""));
+    assert!(INDEX_HTML.contains("Claude 额度桥"));
+    assert!(INDEX_HTML.contains("彻底清除"));
+    assert!(APP_JS.contains("confirmation !== \"DELETE\""));
+    assert!(APP_CSS.contains("settings-grid"));
+    assert!(APP_CSS.contains("notification-banner"));
 }
 
 #[test]
@@ -445,7 +457,11 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(payload["type"], "snapshot");
         assert!(payload["snapshot"]["sessions"].as_array().unwrap().len() >= 3);
-        assert_eq!(payload["snapshot"]["quota"], json!([]));
+        let quota = payload["snapshot"]["quota"].as_array().unwrap();
+        assert_eq!(quota.len(), 2);
+        assert!(quota
+            .iter()
+            .all(|entry| entry["status"] == "unavailable" && entry.get("usedPct").is_none()));
         websocket.close(None).await.unwrap();
     });
 

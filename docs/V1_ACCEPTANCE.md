@@ -80,12 +80,13 @@ not weaken or replace the full plan.
 
 ### M4 - quota, settings, and P1
 
-- [ ] Claude quota bridge never replaces an existing custom status line.
-- [ ] Codex rollout parsing is isolated, version-gated, and read-only.
-- [ ] Missing, stale, or incompatible quota data renders an honest unavailable
+- [x] Claude quota bridge never replaces an existing custom status line.
+- [x] Codex rollout parsing is isolated, version-gated, and read-only.
+- [x] Missing, stale, or incompatible quota data renders an honest unavailable
       state without percentages.
-- [ ] Notification, retention, export, and destructive-clear settings work.
-- [ ] Gemini round-level observation may ship only if contract-tested.
+- [x] Notification, retention, export, and destructive-clear settings work.
+- [x] Gemini round-level observation is intentionally not shipped in v1; it
+      remains optional P1 and did not block either P0 provider.
 
 ### M5 - release evidence
 
