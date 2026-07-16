@@ -50,13 +50,21 @@ tests remain part of the release gate.
 
 Fixture and local compatibility versions:
 
-- Claude Code 2.1.210;
+- Claude Code fixture 2.1.210; local installation validation 2.1.211 with a
+  real post-install event;
 - Codex CLI 0.144.4.
 
 The read-only doctor check reports the local CLI checks as passing and Codex
 canonical Hooks as enabled. It warns, correctly, when the user's real Hook
 configuration and Runtime are not installed; verification did not alter the
 user's real provider configuration or start a paid provider session.
+
+The later user-authorized local installation validated real post-install events
+from Claude Code 2.1.211 and Codex CLI 0.144.4. That installation exposed a
+false doctor warning when Claude's healthy `--version` command took about three
+seconds. Provider-version discovery now allows five seconds, while the
+independent fail-open safety probe remains capped at two seconds. A regression
+test covers a healthy three-second provider version command.
 
 Automated pass-through coverage includes absent Runtime, explicit
 pass-through, mismatched request ID, malformed response, end-of-file, and
@@ -110,7 +118,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
   PASS, zero warnings
 cargo test --workspace --offline
-  PASS, 107 tests and all doc-tests; zero failures
+  PASS, 108 tests and all doc-tests; zero failures
 cargo build --workspace --release --offline
   PASS
 node --check web/app.js

@@ -76,7 +76,7 @@ fn install_fake_provider(root: &TestDir, provider: &str) {
     // A freshly-created shell script can be delayed by macOS executable
     // inspection when these process-heavy integration tests run in parallel.
     // /bin/echo is a stable native stand-in that still proves PATH discovery,
-    // --version execution, output capture, and the two-second kill boundary.
+    // --version execution, and output capture.
     symlink("/bin/echo", fake_bin.join(provider)).unwrap();
 }
 
@@ -258,6 +258,41 @@ fn doctor_json_reports_versions_config_trust_runtime_and_silent_pass_through() {
         by_id("hook.pass_through")["detail"],
         "No approval directive was written to stdout"
     );
+}
+
+#[test]
+fn doctor_accepts_a_slow_but_healthy_provider_version_command() {
+    let root = TestDir::new("doctor-slow-version");
+    install_fake_provider(&root, "claude");
+    install_fake_provider(&root, "codex");
+    let installed = command(&root)
+        .args(["install-hooks", "all"])
+        .output()
+        .unwrap();
+    assert!(installed.status.success());
+
+    let claude = root.0.join("fake-bin/claude");
+    fs::remove_file(&claude).unwrap();
+    write(
+        &claude,
+        b"#!/bin/sh\nsleep 3\nprintf 'slow-claude 1.0\\n'\n",
+        0o700,
+    );
+
+    let output = command(&root).args(["doctor", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let claude_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "claude.cli")
+        .unwrap();
+    assert_eq!(claude_check["status"], "pass");
+    assert!(claude_check["detail"]
+        .as_str()
+        .unwrap()
+        .contains("slow-claude 1.0"));
 }
 
 #[test]

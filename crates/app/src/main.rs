@@ -28,6 +28,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "flow-agent",
@@ -475,13 +477,13 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
-    match version_child.and_then(|child| wait_child_with_timeout(child, Duration::from_secs(2))) {
+    match version_child.and_then(|child| wait_child_with_timeout(child, PROVIDER_VERSION_TIMEOUT)) {
         Ok((_, true)) => checks.push(diagnostic(
             &id,
             DiagnosticStatus::Warning,
             &format!("{} CLI version check timed out", provider.as_str()),
             format!(
-                "{} exceeded 2 seconds and was stopped",
+                "{} exceeded 5 seconds and was stopped",
                 executable.display()
             ),
             Repairability::Manual,
