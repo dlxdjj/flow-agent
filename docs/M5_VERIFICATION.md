@@ -52,7 +52,8 @@ Fixture and local compatibility versions:
 
 - Claude Code fixture 2.1.210; local installation validation 2.1.211 with a
   real post-install event;
-- Codex CLI 0.144.4.
+- Codex CLI fixture 0.144.4; final local installation validation 0.144.5 with
+  a real post-install event and every trust check passing.
 
 The read-only doctor check reports the local CLI checks as passing and Codex
 canonical Hooks as enabled. It warns, correctly, when the user's real Hook
@@ -60,7 +61,7 @@ configuration and Runtime are not installed; verification did not alter the
 user's real provider configuration or start a paid provider session.
 
 The later user-authorized local installation validated real post-install events
-from Claude Code 2.1.211 and Codex CLI 0.144.4. That installation exposed a
+from Claude Code 2.1.211 and Codex CLI 0.144.5. That installation exposed a
 false doctor warning when Claude's healthy `--version` command took about three
 seconds. Provider-version discovery now allows five seconds, while the
 independent fail-open safety probe remains capped at two seconds. A regression
