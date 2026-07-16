@@ -58,6 +58,101 @@ impl HookProvider {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAvailability {
+    pub cli_path: Option<PathBuf>,
+    pub desktop_app_path: Option<PathBuf>,
+    pub bundled_cli_path: Option<PathBuf>,
+}
+
+impl ProviderAvailability {
+    pub fn is_available(&self) -> bool {
+        self.cli_path.is_some() || self.desktop_app_path.is_some()
+    }
+
+    pub fn version_executable(&self) -> Option<&Path> {
+        self.cli_path
+            .as_deref()
+            .or(self.bundled_cli_path.as_deref())
+    }
+
+    pub fn codex_review_command(&self) -> Option<String> {
+        self.cli_path
+            .as_ref()
+            .or(self.bundled_cli_path.as_ref())
+            .map(|path| shell_quote(path))
+    }
+}
+
+pub fn discover_provider_availability(provider: HookProvider) -> ProviderAvailability {
+    let cli_path = find_executable_in_path(provider.as_str());
+    let mut desktop_app_path = None;
+    let mut bundled_cli_path = None;
+
+    #[cfg(target_os = "macos")]
+    {
+        for root in application_roots() {
+            let candidates: &[(&str, &str)] = match provider {
+                HookProvider::Claude => &[("Claude.app", "Contents/MacOS/Claude")],
+                HookProvider::Codex => &[
+                    ("ChatGPT.app", "Contents/Resources/codex"),
+                    ("Codex.app", "Contents/Resources/codex"),
+                ],
+            };
+            for (bundle, executable) in candidates {
+                let app = root.join(bundle);
+                let runtime = app.join(executable);
+                if is_executable_file(&runtime) {
+                    desktop_app_path = Some(app);
+                    if provider == HookProvider::Codex {
+                        bundled_cli_path = Some(runtime);
+                    }
+                    break;
+                }
+            }
+            if desktop_app_path.is_some() {
+                break;
+            }
+        }
+    }
+
+    ProviderAvailability {
+        cli_path,
+        desktop_app_path,
+        bundled_cli_path,
+    }
+}
+
+fn find_executable_in_path(executable: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths).find_map(|directory| {
+            let candidate = directory.join(executable);
+            is_executable_file(&candidate).then_some(candidate)
+        })
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn application_roots() -> Vec<PathBuf> {
+    if cfg!(debug_assertions) {
+        if let Some(roots) = env::var_os("FLOW_AGENT_TEST_APPLICATIONS_PATH") {
+            return env::split_paths(&roots).collect();
+        }
+    }
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Applications"));
+    }
+    roots
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallIntent {

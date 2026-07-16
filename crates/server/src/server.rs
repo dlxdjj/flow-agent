@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use flow_agent_installer::{
-    BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus, ConfigHealth, HookProvider,
-    InstallIntent, InstallOptions, InstallPaths, Installer,
+    discover_provider_availability, BinaryHealth, ClaudeStatuslineStatus, CodexTrustStatus,
+    ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
 };
 use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
@@ -395,8 +395,8 @@ async fn change_setup(
         "codex" => HookProvider::Codex,
         _ => return api_error(StatusCode::BAD_REQUEST, "UNKNOWN_PROVIDER"),
     };
-    if request.action != "uninstall" && !provider_cli_available(provider) {
-        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+    if request.action != "uninstall" && !discover_provider_availability(provider).is_available() {
+        return api_error(StatusCode::CONFLICT, "PROVIDER_CLIENT_MISSING");
     }
     let enhanced_codex_activity = if provider == HookProvider::Codex {
         match load_ui_settings(&state) {
@@ -448,7 +448,10 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
             .installer
             .inspect(provider)
             .map_err(|error| error.to_string())?;
-        let cli_installed = provider_cli_available(provider);
+        let availability = discover_provider_availability(provider);
+        let provider_available = availability.is_available();
+        let cli_installed = availability.cli_path.is_some();
+        let desktop_installed = availability.desktop_app_path.is_some();
         let real_event_verified =
             inspection
                 .installed_definition_changed_at_ms
@@ -458,8 +461,8 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
                             && session.last_event_at >= installed_at
                     })
                 });
-        let status = if !cli_installed {
-            "cli_missing"
+        let status = if !provider_available {
+            "provider_missing"
         } else if inspection.config_health == ConfigHealth::Malformed
             || inspection.codex_config_error.is_some()
         {
@@ -490,6 +493,13 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
             "provider": provider.as_str(),
             "status": status,
             "cliInstalled": cli_installed,
+            "desktopInstalled": desktop_installed,
+            "desktopAppPath": availability.desktop_app_path,
+            "reviewCommand": if provider == HookProvider::Codex {
+                availability.codex_review_command()
+            } else {
+                None
+            },
             "intent": inspection.intent,
             "configPath": inspection.config_path,
             "ownedHandlers": inspection.owned_handlers,
@@ -506,7 +516,7 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
     let first_run = providers.iter().all(|provider| {
         matches!(
             provider.get("status").and_then(Value::as_str),
-            Some("not_installed") | Some("cli_missing")
+            Some("not_installed") | Some("provider_missing") | Some("cli_missing")
         )
     });
     Ok(json!({
@@ -519,21 +529,6 @@ fn setup_value(state: &AppState) -> Result<Value, String> {
             "repairRespectsRemoval": true
         }
     }))
-}
-
-fn provider_cli_available(provider: HookProvider) -> bool {
-    let executable = provider.as_str();
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| {
-            let candidate = directory.join(executable);
-            std::fs::metadata(candidate)
-                .map(|metadata| {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-                .unwrap_or(false)
-        })
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,8 +645,8 @@ async fn update_settings(
             }
         };
         if inspection.intent == InstallIntent::Installed {
-            if !provider_cli_available(HookProvider::Codex) {
-                return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+            if !discover_provider_availability(HookProvider::Codex).is_available() {
+                return api_error(StatusCode::CONFLICT, "PROVIDER_CLIENT_MISSING");
             }
             if let Err(error) = state.installer.install(
                 HookProvider::Codex,
@@ -732,9 +727,11 @@ async fn change_claude_bridge(
         return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
     }
     if matches!(request.action.as_str(), "install" | "wrap")
-        && !provider_cli_available(HookProvider::Claude)
+        && discover_provider_availability(HookProvider::Claude)
+            .cli_path
+            .is_none()
     {
-        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_MISSING");
+        return api_error(StatusCode::CONFLICT, "PROVIDER_CLI_REQUIRED");
     }
     let result = match request.action.as_str() {
         "install" => state.installer.install_claude_statusline().map(|_| ()),

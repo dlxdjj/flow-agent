@@ -222,6 +222,7 @@ h1, h2 { margin: 0; font-size: 22px; line-height: 1; letter-spacing: -.035em; }
 .setup-status.error { color: var(--red); background: var(--red-soft); }
 .setup-status.ready { color: var(--green); background: var(--green-soft); }
 .setup-detail { min-height: 39px; margin: 14px 0 10px; color: #5f6964; font-size: 12px; line-height: 1.55; }
+.setup-runtime { margin: -4px 0 10px; color: var(--green); font-size: 11px; font-weight: 700; }
 .setup-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #909994; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .trust-steps { margin: 10px 0 13px; padding-left: 22px; color: #59635e; font-size: 11px; line-height: 1.65; }
 .setup-actions { gap: 8px; margin-top: 15px; }

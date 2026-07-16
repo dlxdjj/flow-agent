@@ -6,8 +6,8 @@ use flow_agent_core::{
     DOCTOR_PROBE_EVENT, MAX_HOOK_PAYLOAD_BYTES, PERMISSION_COMMIT_DELAY_MS,
 };
 use flow_agent_installer::{
-    BinaryHealth, CodexFeatureStatus, CodexTrustStatus, ConfigHealth, HookProvider, InstallIntent,
-    InstallOptions, InstallPaths, Installer,
+    discover_provider_availability, BinaryHealth, CodexFeatureStatus, CodexTrustStatus,
+    ConfigHealth, HookProvider, InstallIntent, InstallOptions, InstallPaths, Installer,
 };
 use flow_agent_quota::{capture_claude_statusline, statusline_text, QuotaPaths};
 use flow_agent_runtime::{
@@ -238,7 +238,7 @@ fn run_statusline() -> Result<()> {
 fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool) -> Result<()> {
     validate_socket_path(&default_socket_path()).context("invalid Flow Agent socket path")?;
     for provider in target.providers() {
-        ensure_provider_cli(*provider)?;
+        ensure_provider_available(*provider)?;
     }
     let paths = InstallPaths::discover()?;
     let source_binary = std::env::current_exe().context("failed to locate flow-agent binary")?;
@@ -275,7 +275,11 @@ fn install_hooks(target: HookTarget, enhanced_codex_activity: bool, repair: bool
                 .unwrap_or_default()
         );
         if *provider == HookProvider::Codex {
-            println!("Codex requires one manual trust step: open Codex, run /hooks, review and trust each Flow Agent command hook.");
+            let availability = discover_provider_availability(*provider);
+            let command = availability
+                .codex_review_command()
+                .unwrap_or_else(|| "codex".to_owned());
+            println!("Codex requires one manual trust step: run {command}, then run /hooks, review and trust each Flow Agent command hook.");
         }
     }
     Ok(())
@@ -461,18 +465,39 @@ fn diagnostic(
 
 fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
     let id = format!("{}.cli", provider.as_str());
-    let Some(executable) = find_provider_cli(provider) else {
+    let availability = discover_provider_availability(provider);
+    if !availability.is_available() {
         checks.push(diagnostic(
             &id,
             DiagnosticStatus::Fail,
-            &format!("{} CLI is not installed", provider.as_str()),
-            "No executable was found in PATH".to_owned(),
+            &format!("{} client is not installed", provider.as_str()),
+            "No CLI in PATH or supported macOS desktop app was found".to_owned(),
             Repairability::Manual,
-            Some("Install the provider CLI, then run flow-agent doctor again"),
+            Some("Install the provider desktop app or CLI, then run flow-agent doctor again"),
+        ));
+        return;
+    }
+    let Some(executable) = availability.version_executable() else {
+        let app = availability
+            .desktop_app_path
+            .as_deref()
+            .expect("available desktop-only provider must have an app path");
+        checks.push(diagnostic(
+            &id,
+            DiagnosticStatus::Pass,
+            &format!("{} desktop app is available", provider.as_str()),
+            app.display().to_string(),
+            Repairability::NotApplicable,
+            None,
         ));
         return;
     };
-    let version_child = std::process::Command::new(&executable)
+    let source = if availability.cli_path.is_some() {
+        "CLI"
+    } else {
+        "desktop runtime"
+    };
+    let version_child = std::process::Command::new(executable)
         .arg("--version")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -481,7 +506,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
         Ok((_, true)) => checks.push(diagnostic(
             &id,
             DiagnosticStatus::Warning,
-            &format!("{} CLI version check timed out", provider.as_str()),
+            &format!("{} {source} version check timed out", provider.as_str()),
             format!(
                 "{} exceeded 5 seconds and was stopped",
                 executable.display()
@@ -496,7 +521,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
             checks.push(diagnostic(
                 &id,
                 DiagnosticStatus::Pass,
-                &format!("{} CLI is available", provider.as_str()),
+                &format!("{} {source} is available", provider.as_str()),
                 format!("{} · {version}", executable.display()),
                 Repairability::NotApplicable,
                 None,
@@ -505,7 +530,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
         Ok((output, false)) => checks.push(diagnostic(
             &id,
             DiagnosticStatus::Warning,
-            &format!("{} CLI version check failed", provider.as_str()),
+            &format!("{} {source} version check failed", provider.as_str()),
             format!("{} exited with {}", executable.display(), output.status),
             Repairability::Manual,
             Some("Run the provider CLI --version command directly"),
@@ -513,7 +538,7 @@ fn add_cli_check(checks: &mut Vec<DiagnosticCheck>, provider: HookProvider) {
         Err(error) => checks.push(diagnostic(
             &id,
             DiagnosticStatus::Warning,
-            &format!("{} CLI could not be started", provider.as_str()),
+            &format!("{} {source} could not be started", provider.as_str()),
             error.to_string(),
             Repairability::Manual,
             Some("Check executable permissions and PATH"),
@@ -1018,30 +1043,14 @@ fn wait_child_with_timeout(
     }
 }
 
-fn ensure_provider_cli(provider: HookProvider) -> Result<()> {
-    if find_provider_cli(provider).is_none() {
-        let executable = provider.as_str();
+fn ensure_provider_available(provider: HookProvider) -> Result<()> {
+    if !discover_provider_availability(provider).is_available() {
         anyhow::bail!(
-            "{} CLI is not installed; refusing to create provider configuration",
-            executable
+            "{} client is not installed; no CLI in PATH or supported macOS desktop app was found; refusing to create provider configuration",
+            provider.as_str()
         );
     }
     Ok(())
-}
-
-fn find_provider_cli(provider: HookProvider) -> Option<PathBuf> {
-    let executable = provider.as_str();
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|directory| {
-            let candidate = directory.join(executable);
-            std::fs::metadata(&candidate)
-                .map(|metadata| {
-                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                        .then_some(candidate)
-                })
-                .unwrap_or(None)
-        })
-    })
 }
 
 fn serve(socket_path: PathBuf, approval: ApprovalMode, open: bool) -> Result<()> {

@@ -1,11 +1,11 @@
 # v1.1 functional-correction verification
 
-Status: eligible for the requested user-test branch push. The final 115-test
-exact-tree gate and user-amended 2-minute resource gate passed on 2026-07-16;
-the verified binary was installed locally, all 14 doctor checks passed, three
-real quota snapshots were persisted, and the user accepted the current
-functionality and visuals. This record does not satisfy or replace the separate
-48-hour final release soak.
+Status: eligible for the requested user-test branch push. The current tree's
+116-test workspace gate, release build, desktop-only integration test, and five
+user-requested repeat rounds passed on 2026-07-16. The preceding functional
+correction also passed its user-amended 2-minute resource gate, was installed
+locally, passed all 14 doctor checks, and was visually accepted. This record
+does not satisfy or replace the separate 48-hour final release soak.
 
 ## User contract
 
@@ -25,6 +25,8 @@ The main product surface must obey these visible rules:
    explicitly enabled.
 7. Claude and Codex use recognizable image icons throughout the UI instead of
    letter monograms.
+8. A user with only Claude.app and ChatGPT/Codex.app can install and verify
+   hooks without installing global `claude` or `codex` commands.
 
 ## Reference decisions
 
@@ -92,6 +94,21 @@ Adopted lessons:
   leaves original stdout visible, and restores the original object on
   uninstall.
 
+### Desktop-only Provider discovery
+
+- Provider availability is no longer equivalent to a same-name executable in
+  `PATH`. The installer recognizes Claude.app and ChatGPT/Codex.app in the
+  standard system and per-user macOS application locations.
+- Claude Desktop can install the shared user-level Hook configuration without
+  launching its GUI executable for a version check.
+- Codex Desktop exposes its bundled official `codex` executable as the manual
+  `/hooks` review command. Flow Agent still never writes or bypasses trust.
+- Setup JSON and the first-run UI distinguish desktop-app detection from a
+  global CLI and explain that the latter is not required.
+- The Claude status-line quota bridge remains CLI-only because Claude Desktop
+  does not render that terminal status line. Missing this optional adapter does
+  not block Hook installation or Agent control.
+
 ## Exact-tree automated evidence
 
 | Gate | Result |
@@ -103,12 +120,14 @@ Adopted lessons:
 | `cargo test -p flow-agent-server --test m2_api --offline` | PASS, 3 authenticated API cases |
 | `cargo test -p flow-agent --test m2_widget_e2e --offline` | PASS |
 | `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings |
-| `cargo test --workspace --offline -q` | PASS, 115 tests and all doc-tests |
+| `cargo test --workspace --offline` | PASS, 116 tests and all doc-tests |
 | `cargo build --workspace --release --offline` | PASS |
+| desktop-only install/Onboarding/Doctor suite, repeated per user request | PASS, 5/5 rounds, 40/40 cases |
+| release Doctor with provider CLI paths removed | PASS, Claude.app and ChatGPT bundled Codex 0.144.5 detected |
 | `node --check web/app.js` | PASS |
 | `./scripts/m0-e2e.sh` | PASS, Claude allow, Codex deny, pass-through, missing-Runtime fail-open |
 | event-to-WebSocket performance | PASS, p95 104.483 ms, budget 300 ms |
-| final 120-second release resource gate | PASS, 118 samples, CPU 0.000%, RSS max 5,440 KiB |
+| preceding correction's 120-second resource gate | PASS, 118 samples, CPU 0.000%, RSS max 5,440 KiB |
 
 The in-app browser integration failed before navigation with the external
 error `Cannot redefine property: process`. Per its control contract, no
@@ -116,7 +135,7 @@ standalone browser automation was substituted. The user instead tested the
 installed exact release page and accepted its current functionality and
 visuals on 2026-07-16.
 
-The resource report from the exact release binary was:
+The resource report from the preceding accepted correction binary was:
 
 ```json
 {"schemaVersion":1,"durationSeconds":120,"sampleCount":118,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":5440,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}

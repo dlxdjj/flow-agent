@@ -134,7 +134,8 @@ function providerName(provider) {
 function setupStatus(status) {
   return {
     not_installed: { label: "未接入", className: "muted", detail: "不会修改现有配置，点击后先备份再语义合并。" },
-    cli_missing: { label: "未找到 CLI", className: "error", detail: "请先安装这个 Agent 的命令行程序。" },
+    provider_missing: { label: "未找到客户端", className: "error", detail: "请先安装这个 Agent 的桌面客户端或命令行程序。" },
+    cli_missing: { label: "未找到客户端", className: "error", detail: "请先安装这个 Agent 的桌面客户端或命令行程序。" },
     needs_trust: { label: "等待信任", className: "warning", detail: "打开 Codex，输入 /hooks，逐项检查并信任 Flow Agent。" },
     installed_unverified: { label: "等待验证", className: "warning", detail: "配置已经就绪。启动一次真实会话后才能确认接入。" },
     connected: { label: "已接入", className: "ready", detail: "已收到安装后的真实 Agent 事件，实时活动可以正常显示。" },
@@ -163,10 +164,21 @@ function renderSetup() {
     identity.append(element("strong", "", providerName(provider.provider)));
     heading.append(identity, element("span", `setup-status ${status.className}`, status.label));
     card.append(heading, element("p", "setup-detail", status.detail));
+    const detected = provider.cliInstalled && provider.desktopInstalled
+      ? "已检测：桌面客户端 + CLI"
+      : provider.desktopInstalled
+        ? "已检测：桌面客户端（不需要全局 CLI）"
+        : provider.cliInstalled
+          ? "已检测：CLI"
+          : "尚未检测到可用客户端";
+    card.append(element("div", "setup-runtime", detected));
 
     if (provider.provider === "codex" && provider.status === "needs_trust") {
       const steps = element("ol", "trust-steps");
-      for (const step of ["打开任意 Codex 会话", "输入 /hooks", "核对命令路径后选择信任", "启动一个新会话并回到这里刷新"]) {
+      const startStep = provider.cliInstalled
+        ? "打开任意 Codex 终端会话"
+        : `打开终端并运行内置 Codex：${provider.reviewCommand || "ChatGPT.app/Contents/Resources/codex"}`;
+      for (const step of [startStep, "输入 /hooks", "核对命令路径后选择信任", "启动一个新会话并回到这里刷新"]) {
         steps.append(element("li", "", step));
       }
       card.append(steps);

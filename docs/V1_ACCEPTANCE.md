@@ -10,7 +10,9 @@ not weaken or replace the full plan.
 - One Rust binary, `flow-agent`.
 - macOS-first local runtime plus embedded 1600x600 native web UI.
 - Three modules only: Attention, Agent sessions, and Quota.
-- Claude Code and Codex CLI are P0. Gemini round-level observation is P1 and
+- Claude Code and Codex local sessions are P0, whether launched from their CLI
+  or macOS desktop app. A global provider CLI is not a prerequisite when the
+  supported desktop app is present. Gemini round-level observation is P1 and
   cannot block v1 release.
 - External Hook Control handles each official permission request through
   approve, deny, or pass-through. Multiple sessions may wait concurrently, but

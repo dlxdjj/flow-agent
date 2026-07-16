@@ -66,6 +66,10 @@ fn command(root: &TestDir) -> Command {
         .env("HOME", home)
         .env("CODEX_HOME", codex_home)
         .env("FLOW_AGENT_HOME", flow_home)
+        .env(
+            "FLOW_AGENT_TEST_APPLICATIONS_PATH",
+            root.0.join("applications"),
+        )
         .env("PATH", fake_bin);
     command
 }
@@ -78,6 +82,19 @@ fn install_fake_provider(root: &TestDir, provider: &str) {
     // /bin/echo is a stable native stand-in that still proves PATH discovery,
     // --version execution, and output capture.
     symlink("/bin/echo", fake_bin.join(provider)).unwrap();
+}
+
+fn install_fake_desktop_provider(root: &TestDir, provider: &str) -> PathBuf {
+    let executable = match provider {
+        "claude" => root.0.join("applications/Claude.app/Contents/MacOS/Claude"),
+        "codex" => root
+            .0
+            .join("applications/ChatGPT.app/Contents/Resources/codex"),
+        _ => panic!("unsupported fake desktop provider: {provider}"),
+    };
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink("/bin/echo", &executable).unwrap();
+    executable
 }
 
 struct HttpResponse {
@@ -205,9 +222,64 @@ fn cli_refuses_to_create_configuration_for_a_missing_provider() {
         .unwrap();
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("claude CLI is not installed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("claude client is not installed"));
     assert!(!root.0.join("home/.claude/settings.json").exists());
     assert!(!root.0.join("flow-home/bin/flow-agent").exists());
+}
+
+#[test]
+fn desktop_apps_install_without_global_provider_clis() {
+    let root = TestDir::new("desktop-only");
+    let claude_app = install_fake_desktop_provider(&root, "claude");
+    let codex_runtime = install_fake_desktop_provider(&root, "codex");
+
+    let installed = command(&root)
+        .args(["install-hooks", "all"])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&installed.stdout);
+    assert!(stdout.contains("installed claude hooks"));
+    assert!(stdout.contains("installed codex hooks"));
+    assert!(stdout.contains(&codex_runtime.display().to_string()));
+    assert!(root.0.join("home/.claude/settings.json").exists());
+    assert!(root.0.join("alternate-codex-home/hooks.json").exists());
+
+    let doctor = command(&root).args(["doctor", "--json"]).output().unwrap();
+    assert!(doctor.status.success());
+    let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let claude = checks
+        .iter()
+        .find(|check| check["id"] == "claude.cli")
+        .unwrap();
+    let codex = checks
+        .iter()
+        .find(|check| check["id"] == "codex.cli")
+        .unwrap();
+    assert_eq!(claude["status"], "pass");
+    assert_eq!(claude["summary"], "claude desktop app is available");
+    assert!(claude["detail"].as_str().unwrap().contains(
+        claude_app
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    ));
+    assert_eq!(codex["status"], "pass");
+    assert_eq!(codex["summary"], "codex desktop runtime is available");
+    assert!(codex["detail"]
+        .as_str()
+        .unwrap()
+        .contains(&codex_runtime.display().to_string()));
 }
 
 #[test]
@@ -376,8 +448,8 @@ fn doctor_runtime_probe_round_trips_without_creating_a_provider_event() {
 #[test]
 fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
     let root = TestDir::new("onboarding-api");
-    install_fake_provider(&root, "claude");
-    install_fake_provider(&root, "codex");
+    install_fake_desktop_provider(&root, "claude");
+    install_fake_desktop_provider(&root, "codex");
     let claude_config = root.0.join("home/.claude/settings.json");
     let original = json!({"keepUserSetting": true});
     write_json(&claude_config, &original);
@@ -425,6 +497,22 @@ fn onboarding_api_uses_the_installer_and_requires_a_post_install_real_event() {
     );
     assert_eq!(initial.status, 200);
     assert!(initial.body["firstRun"].as_bool().unwrap());
+    assert!(initial.body["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|provider| provider["desktopInstalled"] == true));
+    let codex = initial.body["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider"] == "codex")
+        .unwrap();
+    assert_eq!(codex["cliInstalled"], false);
+    assert!(codex["reviewCommand"]
+        .as_str()
+        .unwrap()
+        .contains("ChatGPT.app/Contents/Resources/codex"));
 
     let installed = http(
         address,

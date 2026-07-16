@@ -222,6 +222,8 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     assert!(APP_JS.contains("SESSION_VISIBLE_FOR_MS"));
     assert!(APP_JS.contains("selectSession(item.sessionId)"));
     assert!(APP_JS.contains("providerIcon(provider.provider)"));
+    assert!(APP_JS.contains("provider_missing"));
+    assert!(APP_JS.contains("打开终端并运行内置 Codex"));
     assert!(APP_JS.contains("/assets/claude.png"));
     assert!(APP_JS.contains("/assets/codex.png"));
     assert!(!include_bytes!("../../../web/assets/claude.png").is_empty());

@@ -51,8 +51,8 @@
 | 项 | 内容 |
 |---|---|
 | 模块 | **待处理（Hero）、Agent 任务、额度** —— 仅三个 |
-| Provider | Claude Code（P0，Hook 细粒度）、Codex CLI（P0，Hook + 批准应答）、Gemini CLI（P1，仅轮级只读） |
-| 接入模式 | **External Hook Control Mode**：Agent 仍由用户在原终端启动；Runtime 旁路观察事件，并在 `PermissionRequest` 阶段临时接管单次批准链路 |
+| Provider | Claude Code CLI/Desktop 本机会话（P0，Hook 细粒度）、Codex CLI/Desktop 本机会话（P0，Hook + 批准应答）、Gemini CLI（P1，仅轮级只读） |
+| 接入模式 | **External Hook Control Mode**：Agent 仍由用户在原 CLI 或桌面客户端启动；Runtime 旁路观察事件，并在 `PermissionRequest` 阶段临时接管单次批准链路。存在受支持桌面 App 时不得强制安装全局 CLI |
 | 直接控制 | 仅 `approve / deny / pass_through_to_terminal`；每个 Session 按实际 capability 显示，不按 Provider 名称硬编码 |
 | 故障回退 | Runtime 不可用或 socket 断开时立即交还；正常等待达到 Provider 专属时限（Claude 24h / Codex 1h）时，Hook 无决定退出，Provider 恢复原生终端批准流程 |
 | 本地动作 | 跳回终端（Runtime 执行 AppleScript/开终端）；完成确认（本地归档） |
@@ -89,7 +89,7 @@ External Hook Control Mode 不等于 Managed Mode：它只控制官方 `Permissi
 ┌────────────────────────────────────────────────────────────────┐
 │ 用户的 Mac                                                      │
 │                                                                  │
-│  Claude Code / Codex CLI（用户自己在终端启动，不归我们管）           │
+│  Claude Code / Codex 本机 CLI 或 Desktop（用户启动，不归我们管）      │
 │        │ 触发 Hook：把 JSON 写入子进程 stdin                       │
 │        ▼                                                         │
 │  [进程A] flow-agent hook --provider claude|codex|gemini           │
@@ -202,12 +202,12 @@ PermissionRequest 的额外铁律：
 
 字段必须按事件解析，**不得假设全事件通用**。公共候选字段包括 `session_id, prompt_id, cwd, hook_event_name, transcript_path, permission_mode`；事件特有字段包括 `tool_name, tool_input, tool_use_id, prompt, last_assistant_message, error` 等。Claude `PermissionRequest` 没有 `tool_use_id`，批准关联一律使用 Flow Agent 自己生成的 `requestId`。`transcript_path` 一律不读取。
 
-### 4.2 Codex CLI（P0）
+### 4.2 Codex CLI / Desktop 本机会话（P0）
 
 配置优先写入独立的 `~/.codex/hooks.json`，避免破坏用户 `config.toml` 的格式与未知字段；若用户已有同层 inline `[hooks]`，安装器必须识别并避免重复。当前版本 Hooks 默认启用；`[features].codex_hooks` 只作为旧版兼容别名，不写入新配置。v1 订阅 `SessionStart, UserPromptSubmit, PermissionRequest, Stop`（默认低噪音集），`PreToolUse/PostToolUse` 作为可选开关。
 
 注意事项（全部来自实测记录）：
-- Hook 安装后需要用户在 Codex CLI 内 `/hooks` 手动信任——**Onboarding 必须引导，不可绕过**；
+- Hook 安装后需要用户在 Codex 官方交互界面内 `/hooks` 手动信任——**Onboarding 必须引导，不可绕过**；桌面用户没有全局 CLI 时，使用 App 内置 Codex 可执行文件进入该审查流程；
 - `PreToolUse/PostToolUse` 不是完整审计边界，不得宣称覆盖所有 shell、文件编辑与 WebSearch 路径；
 - `PermissionRequest` 由 Flow Agent 主动限制为 1 小时；其余事件 hook 进程自身 hard timeout 250ms（fail-open）；
 - Codex `PermissionRequest` 输出使用官方最小 JSON，不附加当前不支持的 `continue/suppressOutput` 字段；

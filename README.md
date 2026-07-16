@@ -40,9 +40,13 @@ with `FLOW_AGENT_HOME=/path/to/data`.
 
 `install-hooks` backs up existing configuration, preserves user and unknown
 fields, writes through a lock and atomic rename, and installs a stable helper
-at `~/.flow-agent/bin/flow-agent`. Codex requires a separate user-controlled
-trust step: open Codex, run `/hooks`, review the exact Flow Agent commands, and
-trust them. Flow Agent never edits Codex trust state or bypasses that review.
+at `~/.flow-agent/bin/flow-agent`. A global provider CLI is not required when
+Claude.app or ChatGPT/Codex.app is installed: the installer discovers the
+desktop app and, for Codex, exposes its bundled official executable for the
+manual trust review. Codex still requires a separate user-controlled trust
+step: start the discovered Codex executable, run `/hooks`, review the exact
+Flow Agent commands, and trust them. Flow Agent never edits Codex trust state
+or bypasses that review.
 
 ```bash
 flow-agent install-hooks claude
