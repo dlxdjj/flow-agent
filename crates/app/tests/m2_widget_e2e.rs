@@ -106,6 +106,9 @@ fn start_runtime(root: &Path) -> (RuntimeGuard, PathBuf, Auth) {
     let mut runtime = Command::new(env!("CARGO_BIN_EXE_flow-agent"))
         .args(["serve", "--socket", socket.to_str().unwrap()])
         .env("FLOW_AGENT_COMMIT_DELAY_MS", "30")
+        .env("FLOW_AGENT_HOME", root.join("flow-home"))
+        .env("HOME", root.join("home"))
+        .env("CODEX_HOME", root.join("codex-home"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,7 +117,10 @@ fn start_runtime(root: &Path) -> (RuntimeGuard, PathBuf, Auth) {
     let mut output = BufReader::new(runtime.stdout.take().unwrap());
     let mut control_line = String::new();
     output.read_line(&mut control_line).unwrap();
-    assert!(control_line.starts_with("Flow Agent control panel: http://"));
+    assert!(
+        control_line.starts_with("Flow Agent control panel: http://"),
+        "unexpected Runtime bootstrap line: {control_line:?}"
+    );
     let url = control_line
         .trim()
         .strip_prefix("Flow Agent control panel: ")
@@ -254,18 +260,20 @@ fn real_claude_and_codex_fixtures_are_controlled_through_the_widget_api() {
             "deny",
         ),
     ];
-    for (provider, fixture, action, expected) in cases {
-        let hook = spawn_hook(&socket, provider, fixture);
-        let attention = wait_for_open_attention(&auth, provider);
-        decide(&auth, &attention, action);
-        let output = hook.wait_with_output().unwrap();
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
-        let directive: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            directive.pointer("/hookSpecificOutput/decision/behavior"),
-            Some(&Value::String(expected.to_owned()))
-        );
+    for _round in 1..=5 {
+        for (provider, fixture, action, expected) in cases {
+            let hook = spawn_hook(&socket, provider, fixture);
+            let attention = wait_for_open_attention(&auth, provider);
+            decide(&auth, &attention, action);
+            let output = hook.wait_with_output().unwrap();
+            assert!(output.status.success());
+            assert!(output.stderr.is_empty());
+            let directive: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                directive.pointer("/hookSpecificOutput/decision/behavior"),
+                Some(&Value::String(expected.to_owned()))
+            );
+        }
     }
 
     drop(runtime);

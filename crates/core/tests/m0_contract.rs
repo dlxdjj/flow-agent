@@ -112,6 +112,20 @@ fn another_codex_hook_denial_cannot_make_our_allow_look_confirmed() {
 }
 
 #[test]
+fn provider_denial_confirms_a_sent_deny_and_clears_widget_ownership() {
+    let mut session = SessionProjection::default();
+    session.apply(EventKind::PromptSubmitted, 1);
+    session.apply(EventKind::PermissionRequested, 2);
+    session.mark_decision_sent(Decision::Deny, 3);
+
+    session.apply(EventKind::PermissionDenied, 4);
+
+    assert_eq!(session.exec_state(), ExecState::Thinking);
+    assert_eq!(session.approval_owner(), None);
+    assert!(session.decision_confirmed());
+}
+
+#[test]
 fn late_tool_events_do_not_revive_a_finished_turn() {
     let mut session = SessionProjection::default();
     session.apply(EventKind::PromptSubmitted, 1);

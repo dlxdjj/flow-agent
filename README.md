@@ -65,18 +65,30 @@ The settings panel can opt into the Claude status-line quota bridge. A custom
 enable** action stores the complete original object, delegates visible output
 to it, captures only the bounded quota fields, and restores it verbatim on
 uninstall. A newly created Claude cache invalidates an earlier unavailable
-snapshot immediately. Codex quota parsing is read-only and currently accepts
-only the fixture-verified 0.144.2 desktop, 0.144.4, and 0.144.5 rollout
-families. The UI always renders
-the three factual slots Claude 5h, Claude 7d, and Codex week; unknown, missing,
-or data older than 30 minutes remains unavailable without an invented
-percentage.
+snapshot immediately. Codex quota parsing is read-only and structurally
+validates the bounded `rate_limits` record instead of hard-coding an account
+period or patch version. The UI renders every valid window returned by the
+source (for example 5 hours, 7 days, 30 days, or a named extra allowance).
+Values older than 30 minutes remain visible as the last valid sample with their
+capture time; Flow Agent never turns age into a fabricated percentage.
 
-Agent sessions are titled from a privacy-bounded current-task summary, show a
-live activity timer/tool state, and stay in the main list only while active,
-waiting for attention, or seen in the last 30 minutes. Selecting an attention
-item pins and highlights its corresponding session. Local export contains the
-sanitized SQLite tables; destructive clear requires the exact confirmation
+Agent sessions use the Provider's own local conversation title as the visible
+main title: Claude's official `session_title` plus bounded `custom-title` /
+`ai-title` compatibility records, or Codex's latest `thread_name` from its
+bounded local session index. The privacy-bounded current question is the plain
+second line with no synthetic prefix, followed only by the current model when
+the Provider supplies one. Project, Provider name, title provenance, and Token
+figures are not mixed into these three visible title lines. Only the resolved
+title and its source are persisted; transcript content and paths never enter
+the browser snapshot. Metadata refreshes while recent sessions are visible and
+falls back honestly to the current-question summary when no Provider title is
+available. Sessions also show total turn time and current phase. Running state
+survives a Runtime restart; completed/idle sessions stay in the main list for
+30 minutes.
+Attention handled in the original Agent is reconciled automatically. Session
+rows expose one of four honest jump levels: exact Codex conversation, matching
+Terminal/iTerm session, application only, or unsupported. Local export contains
+the sanitized SQLite tables; destructive clear requires the exact confirmation
 `DELETE` and preserves Hook integration and backups.
 
 Aggregate metrics never leave the machine automatically. `export-metrics`

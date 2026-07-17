@@ -85,29 +85,59 @@ not weaken or replace the full plan.
 - [x] Claude quota bridge never silently replaces an existing custom status
       line; explicit wrapper mode preserves its visible output and restores
       the complete original object on uninstall.
-- [x] Codex rollout parsing is isolated, version-gated, and read-only.
-- [x] Missing, stale, or incompatible quota data renders an honest unavailable
-      state without percentages.
+- [x] Codex rollout parsing is isolated, structurally validated, bounded, and read-only.
+- [x] Stale quota keeps its last real value and capture time; missing or
+      incompatible data remains honestly unavailable.
 - [x] Notification, retention, export, and destructive-clear settings work.
 - [x] Gemini round-level observation is intentionally not shipped in v1; it
       remains optional P1 and did not block either P0 provider.
 
 ### v1.1 user-functional corrections
 
-- [x] Quota renders exactly Claude 5h, Claude 7d, and Codex week.
-- [x] Codex desktop 0.144.2, CLI 0.144.4, and CLI 0.144.5 quota schemas are
-      separately fixture-gated.
+- [x] Quota renders every valid Provider window without a fixed weekly label.
+- [x] Codex desktop 0.144.2, CLI 0.144.4, and CLI 0.144.5 remain regression
+      fixtures while future versions are accepted only when the same bounded
+      numeric schema validates.
 - [x] A Claude cache created after an unavailable snapshot refreshes
       immediately instead of waiting for the normal five-minute poll.
-- [x] Current-task titles are bounded, migrated safely, and never replaced by
-      a username or project placeholder.
-- [x] Agent rows expose factual live elapsed/tool/waiting state.
+- [x] Provider conversation title is the main title; the bounded current
+      question is plain second-line content and the third line is model-only.
+- [x] Claude official/custom/AI and Codex local thread titles are resolved with
+      bounded reads, explicit provenance, prompt fallback, and no transcript
+      content or path in the browser snapshot.
+- [x] Provider title and current task remain separate, and an older Claude AI
+      title cannot overwrite a newer official/custom title.
+- [x] Agent rows expose factual total-turn time plus current phase.
 - [x] The main list keeps active, attention-bearing, and last-30-minute
       sessions only.
 - [x] Selecting an attention item selects, pins, highlights, and reveals its
       corresponding Agent session.
+- [x] Provider-handled approvals resolve attention and task waiting state.
+- [x] Attention supports safe ignore/dismiss and a visible exit transition.
+- [x] Jump labels and actions distinguish exact Codex thread, matching
+      Terminal/iTerm, application-only, and unsupported environments.
+- [x] A running session and its turn start survive Runtime restart; private
+      jump locators never appear in the browser snapshot.
 - [x] Claude and Codex use locally served image marks in onboarding, attention,
       and session rows; third-party asset attribution is included.
+
+### M9 - Provider title consistency
+
+- [x] Claude official `session_title` is accepted directly from the Hook.
+- [x] Claude custom/AI JSONL titles and Codex `thread_name` are local-only,
+      bounded compatibility sources; unknown or absent metadata falls back.
+- [x] Provider title, project, and bounded current task remain separate fields;
+      the UI intentionally renders title, task content, and model only.
+- [x] Recent title changes refresh without restarting the Runtime.
+- [x] SQLite v4 upgrades in place to v5 with no session loss.
+- [x] Title priority, privacy, API snapshot, and UI rendering are automated.
+- [x] Format, zero-warning Clippy, 127-test workspace suite, release build,
+      five-round Claude/Codex control replay, and 120-second resource gate pass.
+- [x] Exact release installed locally; Runtime/control loop, real Provider
+      events, live title rendering, and browser console checks pass.
+- [ ] User completes Codex's official `/hooks` re-trust and accepts the build.
+- [x] Local commit authorized by the user on 2026-07-17.
+- [ ] GitHub push authorized separately by the user after final local acceptance.
 
 ### M5 - release evidence
 

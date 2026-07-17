@@ -54,6 +54,7 @@ fn supported_lifecycle_events_map_to_normalized_kinds() {
         ("PreToolUse", EventKind::ToolStarted),
         ("PostToolUse", EventKind::ToolFinished),
         ("PermissionRequest", EventKind::PermissionRequested),
+        ("PermissionDenied", EventKind::PermissionDenied),
         ("TaskCreated", EventKind::TaskCreated),
         ("TaskCompleted", EventKind::TaskCompleted),
         ("Stop", EventKind::Stopped),

@@ -105,7 +105,8 @@ h1, h2 { margin: 0; font-size: 22px; line-height: 1; letter-spacing: -.035em; }
 .empty-state h3 { margin: 0 0 8px; font-size: 19px; letter-spacing: -.02em; }
 .empty-state p { max-width: 300px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
 
-.attention-card { flex: 1; display: flex; flex-direction: column; }
+.attention-card { flex: 1; display: flex; flex-direction: column; transition: opacity 180ms ease, transform 180ms ease; }
+.attention-card-leaving { opacity: 0; transform: translateX(24px) scale(.985); pointer-events: none; }
 .attention-kicker { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .attention-kind { min-height: 30px; display: inline-flex; align-items: center; padding: 0 11px; border-radius: 10px; background: var(--orange-soft); color: var(--orange); font-size: 12px; font-weight: 800; }
 .attention-state { color: var(--muted); font-size: 12px; font-weight: 700; }
@@ -146,8 +147,13 @@ h1, h2 { margin: 0; font-size: 22px; line-height: 1; letter-spacing: -.035em; }
 .row-copy { min-width: 0; flex: 1; }
 .row-title { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; }
 .row-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.session-question { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #48524d; font-size: 11px; font-weight: 680; }
 .row-subtitle { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; }
 .session-meta { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 9px; font-weight: 700; }
+.session-jump { margin-top: 6px; padding: 0; border: 0; cursor: pointer; color: var(--blue); background: transparent; font: inherit; font-size: 9px; font-weight: 780; }
+.session-jump:hover { text-decoration: underline; }
+.session-jump.app_only { color: var(--muted); }
+.session-jump:disabled { cursor: default; color: #9aa29e; text-decoration: none; }
 .session-activity { display: flex; align-items: center; gap: 7px; }
 .activity-marker { min-width: 13px; color: var(--blue); font-weight: 900; letter-spacing: -2px; }
 .session-activity.thinking .activity-marker { animation: activity-pulse 1.2s ease-in-out infinite; }
@@ -169,6 +175,8 @@ h1, h2 { margin: 0; font-size: 22px; line-height: 1; letter-spacing: -.035em; }
 .state-pill.failed { color: var(--red); background: var(--red-soft); }
 
 .quota-unavailable { padding: 17px 14px; border-radius: 15px; background: #f5f7f5; }
+.quota-row.stale { border: 1px dashed #c8d0cb; }
+.quota-stale { color: var(--orange); font-weight: 760; }
 .quota-unavailable strong { display: block; font-size: 13px; }
 .quota-unavailable p { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .quota-track { height: 7px; margin-top: 12px; overflow: hidden; border-radius: 4px; background: #e1e6e2; }

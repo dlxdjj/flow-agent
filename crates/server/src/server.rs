@@ -15,7 +15,7 @@ use flow_agent_installer::{
 use flow_agent_quota::{QuotaCollector, QuotaEntry, QuotaPaths};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, MetricEvent, QuotaRecord, RuntimeStore,
-    StoreError, WaiterRegistry,
+    SessionRecord, StoreError, WaiterRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,6 +24,7 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path as FilePath, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,7 +36,6 @@ const SESSION_COOKIE: &str = "flow_agent_session";
 const CSRF_HEADER: &str = "x-flow-agent-csrf";
 const SETTINGS_KEY: &str = "ui_settings";
 const SESSION_LIST_RETENTION_MS: u64 = 30 * 60 * 1_000;
-const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 const APP_CSS: &str = include_str!("../../../web/app.css");
 const APP_JS: &str = include_str!("../../../web/app.js");
@@ -136,7 +136,6 @@ impl ApiServer {
                 refreshed_at: None,
                 claude_cache_modified_at: None,
             })),
-            session_sweep: Arc::new(Mutex::new(None)),
             data_paths,
         };
         let router = router(state);
@@ -208,7 +207,6 @@ struct AppState {
     quota_poll_interval: Duration,
     installer: Arc<Installer>,
     quota: Arc<Mutex<QuotaState>>,
-    session_sweep: Arc<Mutex<Option<Instant>>>,
     data_paths: DataPaths,
 }
 
@@ -251,6 +249,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/data/clear", post(clear_data))
         .route("/api/v1/commands", post(command))
         .route("/api/v1/commands/{id}/undo", post(undo))
+        .route("/api/v1/sessions/{id}/jump", post(jump_session))
         .route("/api/v1/ws", get(websocket))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
@@ -936,6 +935,11 @@ async fn command(
     if attention.request_id != request.request_id {
         return api_error(StatusCode::CONFLICT, "REQUEST_MISMATCH");
     }
+    let normalized_request_action = if request.action == "dismiss" && attention.kind == "approval" {
+        "pass_through"
+    } else {
+        request.action.as_str()
+    };
     if let Some(existing) = snapshot
         .commands
         .iter()
@@ -943,7 +947,7 @@ async fn command(
     {
         if existing.attention_id != request.attention_id
             || existing.request_id != request.request_id
-            || existing.action != request.action
+            || existing.action != normalized_request_action
         {
             return api_error(StatusCode::CONFLICT, "COMMAND_MISMATCH");
         }
@@ -985,7 +989,7 @@ async fn command(
             }
             command_response(StatusCode::ACCEPTED, request.id, claim.state)
         }
-        "pass_through" => {
+        "pass_through" | "dismiss" if attention.kind == "approval" => {
             let Some(request_id) = request.request_id else {
                 return api_error(StatusCode::CONFLICT, "MISSING_REQUEST_ID");
             };
@@ -1008,14 +1012,14 @@ async fn command(
             }
             command_response(StatusCode::OK, request.id, claim.state)
         }
-        "ack" | "snooze" => {
+        "ack" | "snooze" | "dismiss" => {
             if attention.kind == "approval" {
                 return api_error(StatusCode::CONFLICT, "INVALID_ACTION");
             }
-            let action = if request.action == "ack" {
-                AttentionAction::Ack
-            } else {
-                AttentionAction::Snooze
+            let action = match request.action.as_str() {
+                "ack" => AttentionAction::Ack,
+                "snooze" => AttentionAction::Snooze,
+                _ => AttentionAction::Dismiss,
             };
             match state
                 .store
@@ -1028,6 +1032,184 @@ async fn command(
         _ => api_error(StatusCode::BAD_REQUEST, "UNKNOWN_ACTION"),
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JumpTarget {
+    CodexThread(String),
+    ITermSession,
+    TerminalTty,
+    AppBundle(&'static str),
+    Unsupported,
+}
+
+async fn jump_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized_mutation(&state, &headers) {
+        return api_error(StatusCode::FORBIDDEN, "UNAUTHORIZED_MUTATION");
+    }
+    let Ok(snapshot) = state.store.snapshot() else {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR");
+    };
+    let Some(session) = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "SESSION_NOT_FOUND");
+    };
+    let target = jump_target(session);
+    if target == JumpTarget::Unsupported {
+        return api_error(StatusCode::CONFLICT, "JUMP_UNSUPPORTED");
+    }
+    match run_jump_target(&target, session) {
+        Ok(true) => Json(json!({
+            "success": true,
+            "capability": session.jump_capability,
+            "label": session.jump_label,
+        }))
+        .into_response(),
+        Ok(false) | Err(_) => api_error_detail(
+            StatusCode::CONFLICT,
+            "JUMP_FAILED",
+            "系统没有找到目标窗口，或尚未授予应用控制权限",
+        ),
+    }
+}
+
+fn jump_target(session: &SessionRecord) -> JumpTarget {
+    if session.jump_capability == "exact_conversation"
+        && session.provider == "codex"
+        && session.term_surface.as_deref() == Some("codex_app")
+        && Uuid::parse_str(&session.provider_session_id).is_ok()
+    {
+        return JumpTarget::CodexThread(session.provider_session_id.clone());
+    }
+    let app = session
+        .term_app
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let bundle = session
+        .term_bundle_id
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if session.jump_capability == "terminal" {
+        if (app.contains("iterm") || bundle == "com.googlecode.iterm2")
+            && session.term_session_id.as_deref().is_some_and(safe_locator)
+        {
+            return JumpTarget::ITermSession;
+        }
+        if (app == "apple_terminal" || bundle == "com.apple.terminal")
+            && session.term_tty.as_deref().is_some_and(safe_locator)
+        {
+            return JumpTarget::TerminalTty;
+        }
+    }
+    if session.jump_capability == "app_only" {
+        if session.term_surface.as_deref() == Some("codex_app") || bundle == "com.openai.codex" {
+            return JumpTarget::AppBundle("com.openai.codex");
+        }
+        if session.term_surface.as_deref() == Some("claude_app")
+            || bundle == "com.anthropic.claudefordesktop"
+        {
+            return JumpTarget::AppBundle("com.anthropic.claudefordesktop");
+        }
+        if app.contains("iterm") || bundle == "com.googlecode.iterm2" {
+            return JumpTarget::AppBundle("com.googlecode.iterm2");
+        }
+        if app == "apple_terminal" || bundle == "com.apple.terminal" {
+            return JumpTarget::AppBundle("com.apple.Terminal");
+        }
+        if app == "vscode" || bundle == "com.microsoft.vscode" {
+            return JumpTarget::AppBundle("com.microsoft.VSCode");
+        }
+        if app.contains("warp") || bundle.starts_with("dev.warp.") {
+            return JumpTarget::AppBundle("dev.warp.Warp-Stable");
+        }
+    }
+    JumpTarget::Unsupported
+}
+
+fn safe_locator(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '.' | ':' | '-')
+        })
+}
+
+fn run_jump_target(target: &JumpTarget, session: &SessionRecord) -> io::Result<bool> {
+    let status = match target {
+        JumpTarget::CodexThread(thread_id) => ProcessCommand::new("/usr/bin/open")
+            .arg(format!("codex://threads/{thread_id}"))
+            .status()?,
+        JumpTarget::ITermSession => ProcessCommand::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(ITERM_JUMP_SCRIPT)
+            .env(
+                "FLOW_AGENT_JUMP_SESSION",
+                session.term_session_id.as_deref().unwrap_or_default(),
+            )
+            .env(
+                "FLOW_AGENT_JUMP_TTY",
+                session.term_tty.as_deref().unwrap_or_default(),
+            )
+            .status()?,
+        JumpTarget::TerminalTty => ProcessCommand::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(TERMINAL_JUMP_SCRIPT)
+            .env(
+                "FLOW_AGENT_JUMP_TTY",
+                session.term_tty.as_deref().unwrap_or_default(),
+            )
+            .status()?,
+        JumpTarget::AppBundle(bundle) => ProcessCommand::new("/usr/bin/open")
+            .args(["-b", *bundle])
+            .status()?,
+        JumpTarget::Unsupported => return Ok(false),
+    };
+    Ok(status.success())
+}
+
+const ITERM_JUMP_SCRIPT: &str = r#"
+set targetSession to system attribute "FLOW_AGENT_JUMP_SESSION"
+set targetTty to system attribute "FLOW_AGENT_JUMP_TTY"
+tell application "iTerm2"
+  repeat with candidateWindow in windows
+    repeat with candidateTab in tabs of candidateWindow
+      repeat with candidateSession in sessions of candidateTab
+        if (unique ID of candidateSession is targetSession) or (targetTty is not "" and tty of candidateSession is targetTty) then
+          select candidateSession
+          activate
+          return
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell
+error "target session not found"
+"#;
+
+const TERMINAL_JUMP_SCRIPT: &str = r#"
+set targetTty to system attribute "FLOW_AGENT_JUMP_TTY"
+tell application "Terminal"
+  repeat with candidateWindow in windows
+    repeat with candidateTab in tabs of candidateWindow
+      if tty of candidateTab is targetTty then
+        set selected tab of candidateWindow to candidateTab
+        set index of candidateWindow to 1
+        activate
+        return
+      end if
+    end repeat
+  end repeat
+end tell
+error "target tab not found"
+"#;
 
 fn schedule_decision(
     state: AppState,
@@ -1116,7 +1298,6 @@ async fn websocket_loop(mut socket: WebSocket, state: AppState) {
 
 fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
     let now = now_millis();
-    reconcile_sessions_if_due(state, now)?;
     let mut snapshot = state.store.snapshot()?;
     let visible_attention_sessions = snapshot
         .attention
@@ -1131,7 +1312,13 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
         .collect::<HashSet<_>>();
     let cutoff = now.saturating_sub(SESSION_LIST_RETENTION_MS);
     snapshot.sessions.retain(|session| {
-        session.last_event_at >= cutoff || visible_attention_sessions.contains(session.id.as_str())
+        let active = !matches!(
+            session.exec_state.as_str(),
+            "idle" | "response_finished" | "failed"
+        );
+        active
+            || session.last_event_at >= cutoff
+            || visible_attention_sessions.contains(session.id.as_str())
     });
     let quota = quota_entries(state)?;
     Ok(json!({
@@ -1144,27 +1331,6 @@ fn snapshot_value(state: &AppState) -> Result<Value, StoreError> {
             "metrics": snapshot.metrics
         }
     }))
-}
-
-fn reconcile_sessions_if_due(state: &AppState, now: u64) -> Result<(), StoreError> {
-    let should_sweep = {
-        let mut last = state
-            .session_sweep
-            .lock()
-            .map_err(|_| StoreError::Storage("session sweep lock is poisoned".to_owned()))?;
-        if last.is_some_and(|instant| instant.elapsed() < SESSION_SWEEP_INTERVAL) {
-            false
-        } else {
-            *last = Some(Instant::now());
-            true
-        }
-    };
-    if should_sweep {
-        state
-            .store
-            .reconcile_session_liveness(Vec::new(), now, SESSION_LIST_RETENTION_MS)?;
-    }
-    Ok(())
 }
 
 fn quota_entries(state: &AppState) -> Result<Vec<QuotaEntry>, StoreError> {
@@ -1354,13 +1520,102 @@ mod tests {
                 refreshed_at: None,
                 claude_cache_modified_at: None,
             })),
-            session_sweep: Arc::new(Mutex::new(None)),
             data_paths: DataPaths {
                 cache: root.join("flow-home/cache"),
                 spool: root.join("flow-home/spool"),
                 diagnostics: root.join("flow-home/diagnostics"),
             },
         }
+    }
+
+    #[test]
+    fn jump_capabilities_map_only_to_targets_the_runtime_can_really_open() {
+        let root = std::env::temp_dir().join(format!(
+            "flow-agent-server-jump-targets-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+        let codex_id = Uuid::now_v7().to_string();
+        let cases = [
+            (
+                flow_agent_core::Provider::Codex,
+                codex_id.as_str(),
+                flow_agent_core::TermContext {
+                    app: None,
+                    session_id: None,
+                    tty: None,
+                    title: None,
+                    bundle_id: Some("com.openai.codex".to_owned()),
+                    surface: Some("codex_app".to_owned()),
+                },
+            ),
+            (
+                flow_agent_core::Provider::Claude,
+                "iterm-session",
+                flow_agent_core::TermContext {
+                    app: Some("iTerm.app".to_owned()),
+                    session_id: Some("w0t0p0:ABC-123".to_owned()),
+                    tty: None,
+                    title: None,
+                    bundle_id: Some("com.googlecode.iterm2".to_owned()),
+                    surface: Some("terminal".to_owned()),
+                },
+            ),
+            (
+                flow_agent_core::Provider::Claude,
+                "claude-app-session",
+                flow_agent_core::TermContext {
+                    app: None,
+                    session_id: None,
+                    tty: None,
+                    title: None,
+                    bundle_id: Some("com.anthropic.claudefordesktop".to_owned()),
+                    surface: Some("claude_app".to_owned()),
+                },
+            ),
+        ];
+        for (provider, session_id, term) in cases {
+            let mut request = flow_agent_core::BridgeRequest::from_hook_at(
+                provider,
+                json!({
+                    "hook_event_name":"UserPromptSubmit",
+                    "session_id":session_id,
+                    "prompt":"jump test"
+                }),
+                now_millis(),
+            );
+            request.term = Some(term);
+            store.ingest(request).unwrap();
+        }
+
+        let snapshot = store.snapshot().unwrap();
+        let exact = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == codex_id)
+            .unwrap();
+        assert_eq!(exact.jump_label, "精确打开对话");
+        assert!(matches!(jump_target(exact), JumpTarget::CodexThread(_)));
+        let terminal = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == "iterm-session")
+            .unwrap();
+        assert_eq!(terminal.jump_label, "打开对应终端");
+        assert_eq!(jump_target(terminal), JumpTarget::ITermSession);
+        let app = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.provider_session_id == "claude-app-session")
+            .unwrap();
+        assert_eq!(app.jump_label, "只能打开应用");
+        assert_eq!(
+            jump_target(app),
+            JumpTarget::AppBundle("com.anthropic.claudefordesktop")
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

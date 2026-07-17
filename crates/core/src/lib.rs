@@ -73,6 +73,7 @@ pub enum EventKind {
     ToolFinished,
     ToolFailed,
     PermissionRequested,
+    PermissionDenied,
     Notification,
     SubagentStarted,
     SubagentStopped,
@@ -149,6 +150,7 @@ impl SessionProjection {
         let confirms_sent_decision = matches!(
             (self.decision_sent, event),
             (Some(Decision::Allow), EventKind::ToolFinished)
+                | (Some(Decision::Deny), EventKind::PermissionDenied)
         );
         if confirms_sent_decision {
             self.decision_confirmed = true;
@@ -177,6 +179,10 @@ impl SessionProjection {
                 self.decision_sent_at = None;
                 self.decision_sent = None;
                 self.decision_confirmed = false;
+            }
+            EventKind::PermissionDenied => {
+                self.exec_state = ExecState::Thinking;
+                self.approval_owner = None;
             }
             EventKind::Compacting => self.exec_state = ExecState::Compacting,
             EventKind::Stopped => self.exec_state = ExecState::ResponseFinished,
@@ -350,6 +356,10 @@ pub struct TermContext {
     pub session_id: Option<String>,
     pub tty: Option<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
 }
 
 impl BridgeRequest {
@@ -485,17 +495,46 @@ fn owned_raw_string(raw: &Value, key: &str) -> Option<String> {
 }
 
 fn terminal_context() -> Option<TermContext> {
+    let app = std::env::var("TERM_PROGRAM")
+        .ok()
+        .or_else(|| std::env::var("LC_TERMINAL").ok());
+    let bundle_id = std::env::var("__CFBundleIdentifier").ok();
+    let surface = std::env::var("FLOW_AGENT_SURFACE")
+        .ok()
+        .filter(|value| matches!(value.as_str(), "terminal" | "codex_app" | "claude_app"))
+        .or_else(|| infer_surface(app.as_deref(), bundle_id.as_deref()));
     let context = TermContext {
-        app: std::env::var("TERM_PROGRAM").ok(),
+        app,
         session_id: std::env::var("TERM_SESSION_ID").ok(),
         tty: std::env::var("TTY").ok(),
         title: std::env::var("FLOW_AGENT_TERM_TITLE").ok(),
+        bundle_id,
+        surface,
     };
     (context.app.is_some()
         || context.session_id.is_some()
         || context.tty.is_some()
-        || context.title.is_some())
+        || context.title.is_some()
+        || context.bundle_id.is_some()
+        || context.surface.is_some())
     .then_some(context)
+}
+
+fn infer_surface(app: Option<&str>, bundle_id: Option<&str>) -> Option<String> {
+    let app = app.unwrap_or_default().to_ascii_lowercase();
+    let bundle = bundle_id.unwrap_or_default().to_ascii_lowercase();
+    if bundle == "com.openai.codex" || app == "codex" {
+        return Some("codex_app".to_owned());
+    }
+    if bundle == "com.anthropic.claudefordesktop" || app == "claude" {
+        return Some("claude_app".to_owned());
+    }
+    (!app.is_empty()
+        || bundle == "com.apple.terminal"
+        || bundle == "com.googlecode.iterm2"
+        || bundle == "com.microsoft.vscode"
+        || bundle.starts_with("dev.warp."))
+    .then(|| "terminal".to_owned())
 }
 
 pub fn permission_directive(provider: Provider, decision: Decision) -> Option<Value> {

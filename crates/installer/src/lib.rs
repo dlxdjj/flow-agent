@@ -25,6 +25,7 @@ const CLAUDE_EVENTS: &[&str] = &[
     "PostToolUse",
     "PostToolUseFailure",
     "PermissionRequest",
+    "PermissionDenied",
     "Notification",
     "Stop",
     "StopFailure",

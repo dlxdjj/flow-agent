@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use flow_agent_core::{BridgeRequest, Decision, Provider, ReplyAction};
+use flow_agent_core::{BridgeRequest, Decision, Provider, ReplyAction, TermContext};
 use flow_agent_runtime::{
     ApprovalAction, AttentionAction, CommandState, EventSpool, InstanceError, RuntimeInstanceGuard,
     RuntimeStore, SpoolError, StoreError, WaiterRegistry,
@@ -80,6 +80,8 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
     let before = store.snapshot().unwrap();
     assert_eq!(before.sessions.len(), 1);
     assert_eq!(before.sessions[0].title, None);
+    assert_eq!(before.sessions[0].provider_title, None);
+    assert_eq!(before.sessions[0].provider_title_source, None);
     store
         .ingest(BridgeRequest::from_hook_at(
             Provider::Claude,
@@ -101,9 +103,89 @@ fn existing_v1_database_adds_task_titles_without_losing_sessions() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        5
     );
     drop(connection);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_titles_are_separate_from_the_live_task_and_follow_claude_updates() {
+    let root = temp_root("provider-title");
+    let database = root.join("data.sqlite");
+    let transcript = root
+        .join(".claude/projects/demo")
+        .join("title-session.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        "{\"type\":\"ai-title\",\"aiTitle\":\"客户端 AI 标题\"}\n",
+    )
+    .unwrap();
+    let store = RuntimeStore::open(&database).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"SessionStart",
+                "session_id":"title-session",
+                "cwd":"/tmp/demo",
+                "transcript_path":transcript,
+                "session_title":"Claude 当前官方标题"
+            }),
+            1_000,
+        ))
+        .unwrap();
+
+    let initial = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(
+        initial.provider_title.as_deref(),
+        Some("Claude 当前官方标题")
+    );
+    assert_eq!(
+        initial.provider_title_source.as_deref(),
+        Some("claude_session_title")
+    );
+    assert_eq!(initial.title, None);
+
+    fs::write(
+        &transcript,
+        concat!(
+            "{\"type\":\"ai-title\",\"aiTitle\":\"客户端 AI 标题\"}\n",
+            "{\"type\":\"custom-title\",\"customTitle\":\"用户重命名后的标题\"}\n"
+        ),
+    )
+    .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"title-session",
+                "cwd":"/tmp/demo",
+                "transcript_path":transcript,
+                "prompt":"继续处理实时状态同步"
+            }),
+            2_000,
+        ))
+        .unwrap();
+
+    let updated = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(
+        updated.provider_title.as_deref(),
+        Some("用户重命名后的标题")
+    );
+    assert_eq!(
+        updated.provider_title_source.as_deref(),
+        Some("claude_custom_title")
+    );
+    assert_eq!(updated.title.as_deref(), Some("继续处理实时状态同步"));
+    let public = serde_json::to_value(updated).unwrap();
+    assert_eq!(public["providerTitle"], "用户重命名后的标题");
+    assert_eq!(public["title"], "继续处理实时状态同步");
+    assert!(!public.to_string().contains("transcript_path"));
+
+    drop(store);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -137,7 +219,108 @@ fn current_task_title_is_a_bounded_prompt_summary_with_live_activity_time() {
     assert!(title.starts_with("修复额度、实时进程和任务列表"));
     assert!(title.chars().count() <= 65);
     assert_eq!(session.activity_since, Some(9_000));
+    assert_eq!(session.turn_started_at, Some(9_000));
+    assert_eq!(session.turn_ended_at, None);
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn normalized_usage_is_exposed_only_when_provider_supplies_real_token_fields() {
+    let root = temp_root("token-usage");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"usage-session",
+                "turn_id":"turn-1",
+                "cwd":"/tmp/token-project",
+                "prompt":"Measure the current turn"
+            }),
+            40_000,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"Notification",
+                "session_id":"usage-session",
+                "turn_id":"turn-1",
+                "cwd":"/tmp/token-project",
+                "tokenUsage": { "totalTokens": 12_345 },
+                "contextWindow": 200_000
+            }),
+            40_500,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"Stop",
+                "session_id":"usage-session",
+                "turn_id":"turn-1",
+                "cwd":"/tmp/token-project"
+            }),
+            41_000,
+        ))
+        .unwrap();
+
+    let session = store.snapshot().unwrap().sessions.remove(0);
+    assert_eq!(session.token_total, Some(12_345));
+    assert_eq!(session.context_window_tokens, Some(200_000));
+    assert_eq!(session.turn_started_at, Some(40_000));
+    assert_eq!(session.turn_ended_at, Some(41_000));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_restores_running_session_and_keeps_private_jump_locator_out_of_json() {
+    let root = temp_root("restart-running-jump");
+    let database = root.join("data.sqlite");
+    let provider_session_id = Uuid::now_v7().to_string();
+    {
+        let store = RuntimeStore::open(&database).unwrap();
+        let mut request = BridgeRequest::from_hook_at(
+            Provider::Codex,
+            json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":provider_session_id,
+                "turn_id":"turn-1",
+                "cwd":"/tmp/restart-project",
+                "prompt":"Continue after Flow Agent restarts"
+            }),
+            50_000,
+        );
+        request.term = Some(TermContext {
+            app: None,
+            session_id: Some("private-window-id".to_owned()),
+            tty: Some("/dev/ttys999".to_owned()),
+            title: Some("private title".to_owned()),
+            bundle_id: Some("com.openai.codex".to_owned()),
+            surface: Some("codex_app".to_owned()),
+        });
+        store.ingest(request).unwrap();
+        let before = store.snapshot().unwrap();
+        assert_eq!(before.sessions[0].jump_capability, "exact_conversation");
+        let serialized = serde_json::to_string(&before).unwrap();
+        assert!(serialized.contains("精确打开对话"));
+        assert!(!serialized.contains("private-window-id"));
+        assert!(!serialized.contains("/dev/ttys999"));
+        assert!(!serialized.contains("com.openai.codex"));
+    }
+
+    let reopened = RuntimeStore::open(&database).unwrap();
+    let session = &reopened.snapshot().unwrap().sessions[0];
+    assert_eq!(session.exec_state, "thinking");
+    assert_eq!(session.turn_started_at, Some(50_000));
+    assert_eq!(session.jump_capability, "exact_conversation");
+    assert_eq!(session.jump_label, "精确打开对话");
+    drop(reopened);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -998,6 +1181,14 @@ fn factual_error_question_and_completion_attention_support_local_actions() {
         .unwrap()
         .id
         .clone();
+    assert_eq!(
+        snapshot
+            .attention
+            .iter()
+            .find(|item| item.kind == "question")
+            .and_then(|item| item.detail.as_deref()),
+        Some("Which database should I use?")
+    );
     assert!(snapshot
         .attention
         .iter()
@@ -1013,7 +1204,7 @@ fn factual_error_question_and_completion_attention_support_local_actions() {
         store
             .act_on_attention(
                 Uuid::now_v7(),
-                question_id,
+                question_id.clone(),
                 AttentionAction::Snooze,
                 now + 10,
             )
@@ -1029,6 +1220,150 @@ fn factual_error_question_and_completion_attention_support_local_actions() {
         .attention
         .iter()
         .any(|item| item.kind == "question" && item.state == "snoozed"));
+    store
+        .act_on_attention(
+            Uuid::now_v7(),
+            question_id,
+            AttentionAction::Dismiss,
+            now + 11,
+        )
+        .unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .attention
+        .iter()
+        .any(|item| item.kind == "question" && item.state == "dismissed"));
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_handled_approval_resolves_attention_and_session_waiting_state() {
+    let root = temp_root("provider-handled-approval");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    let now = 20_000;
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "external-session",
+            Some("turn-1"),
+            None,
+            now,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PermissionRequest",
+            "external-session",
+            Some("turn-1"),
+            Some("cargo test"),
+            now + 1,
+        ))
+        .unwrap();
+    let waiting = store.snapshot().unwrap();
+    assert_eq!(waiting.sessions[0].exec_state, "awaiting_approval");
+    assert_eq!(waiting.attention[0].state, "open");
+    assert!(waiting.attention[0]
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("终端命令")));
+
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PostToolUse",
+            "external-session",
+            Some("turn-1"),
+            Some("cargo test"),
+            now + 2,
+        ))
+        .unwrap();
+    let resolved = store.snapshot().unwrap();
+    assert_eq!(resolved.sessions[0].exec_state, "thinking");
+    assert_eq!(resolved.sessions[0].approval_owner, None);
+    assert_eq!(resolved.attention[0].state, "resolved");
+    assert_eq!(
+        resolved.attention[0].resolution.as_deref(),
+        Some("provider_approved")
+    );
+
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_denied_event_resolves_unhandled_attention() {
+    let root = temp_root("provider-denied");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PermissionRequest",
+            "denied-session",
+            Some("turn-1"),
+            Some("git push"),
+            30_000,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PermissionDenied",
+            "denied-session",
+            Some("turn-1"),
+            None,
+            30_001,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.attention[0].state, "resolved");
+    assert_eq!(
+        snapshot.attention[0].resolution.as_deref(),
+        Some("provider_denied")
+    );
+    assert_eq!(snapshot.sessions[0].exec_state, "thinking");
+    assert_eq!(snapshot.sessions[0].approval_owner, None);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_new_prompt_closes_attention_left_open_by_the_previous_turn() {
+    let root = temp_root("new-prompt-closes-attention");
+    let store = RuntimeStore::open(root.join("data.sqlite")).unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "PermissionRequest",
+            "next-turn-session",
+            Some("turn-1"),
+            Some("cargo test"),
+            60_000,
+        ))
+        .unwrap();
+    store
+        .ingest(request_at(
+            Provider::Claude,
+            "UserPromptSubmit",
+            "next-turn-session",
+            Some("turn-2"),
+            None,
+            60_001,
+        ))
+        .unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(snapshot.attention[0].state, "resolved");
+    assert_eq!(
+        snapshot.attention[0].resolution.as_deref(),
+        Some("provider_closed")
+    );
+    assert_eq!(snapshot.sessions[0].exec_state, "thinking");
+    assert_eq!(snapshot.sessions[0].approval_owner, None);
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

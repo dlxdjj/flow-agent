@@ -214,13 +214,23 @@ fn embedded_ui_contract_is_small_honest_and_complete() {
     }
     assert!(!APP_JS.contains("innerHTML"));
     assert!(!INDEX_HTML.contains('$'));
-    assert!(APP_JS.contains("Claude · 5 小时"));
-    assert!(APP_JS.contains("Claude · 7 天"));
-    assert!(APP_JS.contains("Codex · 本周"));
-    assert!(APP_JS.contains("这个额度窗口暂时没有返回可验证数据"));
-    assert!(APP_JS.contains("quota.status !== \"available\""));
+    assert!(APP_JS.contains("quotaDurationLabel"));
+    assert!(APP_JS.contains("保留上次有效值"));
+    assert!(!APP_JS.contains("Codex · 本周"));
+    assert!(APP_JS.contains("额度来源没有返回可验证数据"));
+    assert!(APP_JS.contains("const hasLastValue"));
     assert!(APP_JS.contains("SESSION_VISIBLE_FOR_MS"));
     assert!(APP_JS.contains("selectSession(item.sessionId)"));
+    assert!(APP_JS.contains("session.jumpLabel"));
+    assert!(APP_JS.contains("session.jumpCapability"));
+    assert!(APP_JS.contains("当前环境不支持跳转"));
+    assert!(APP_JS.contains("session.providerTitle"));
+    assert!(APP_JS.contains("const clientTitle = session.providerTitle || session.title"));
+    assert!(APP_JS.contains("element(\"div\", \"session-meta\", session.model)"));
+    assert!(!APP_JS.contains("providerTitleSourceLabel"));
+    assert!(!APP_JS.contains("当前："));
+    assert!(!APP_JS.contains("session.project || \"未命名项目\""));
+    assert!(APP_JS.contains("/api/v1/sessions/"));
     assert!(APP_JS.contains("providerIcon(provider.provider)"));
     assert!(APP_JS.contains("provider_missing"));
     assert!(APP_JS.contains("打开终端并运行内置 Codex"));
@@ -377,16 +387,17 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
     let request_id = permission.request_id.unwrap();
     let registration = ingest_waiting(&store, &waiters, permission);
     let approval = store.snapshot().unwrap().attention[0].clone();
+    let handoff_id = Uuid::now_v7();
     let pass = request(
         server.address(),
         "POST",
         "/api/v1/commands",
         &headers,
         Some(&json!({
-            "id": Uuid::now_v7(),
+            "id": handoff_id,
             "attentionId": approval.id,
             "requestId": request_id,
-            "action": "pass_through"
+            "action": "dismiss"
         })),
     );
     assert_eq!(pass.status, 200);
@@ -396,6 +407,20 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         .unwrap()
         .decision()
         .is_none());
+    let repeated_handoff = request(
+        server.address(),
+        "POST",
+        "/api/v1/commands",
+        &headers,
+        Some(&json!({
+            "id": handoff_id,
+            "attentionId": approval.id,
+            "requestId": request_id,
+            "action": "dismiss"
+        })),
+    );
+    assert_eq!(repeated_handoff.status, 200);
+    assert_eq!(repeated_handoff.body["state"], "passed_through");
 
     store
         .ingest(event(
@@ -413,6 +438,18 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
             "snooze-session",
             "turn-snooze",
             None,
+        ))
+        .unwrap();
+    store
+        .ingest(BridgeRequest::from_hook_at(
+            Provider::Claude,
+            json!({
+                "hook_event_name":"SessionStart",
+                "session_id":"titled-session",
+                "cwd":"/tmp/real-project",
+                "session_title":"客户端中的真实标题"
+            }),
+            now_millis(),
         ))
         .unwrap();
     let items = store.snapshot().unwrap().attention;
@@ -467,12 +504,19 @@ fn pass_through_ack_snooze_and_websocket_snapshot_are_real() {
         let frame = websocket.next().await.unwrap().unwrap();
         let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(payload["type"], "snapshot");
-        assert!(payload["snapshot"]["sessions"].as_array().unwrap().len() >= 3);
+        let sessions = payload["snapshot"]["sessions"].as_array().unwrap();
+        assert!(sessions.len() >= 4);
+        let titled = sessions
+            .iter()
+            .find(|session| session["providerSessionId"] == "titled-session")
+            .unwrap();
+        assert_eq!(titled["providerTitle"], "客户端中的真实标题");
+        assert_eq!(titled["providerTitleSource"], "claude_session_title");
         let quota = payload["snapshot"]["quota"].as_array().unwrap();
         assert_eq!(quota.len(), 3);
         assert_eq!(quota[0]["window"], "5h");
         assert_eq!(quota[1]["window"], "7d");
-        assert_eq!(quota[2]["window"], "week");
+        assert_eq!(quota[2]["window"], "unknown");
         assert!(quota
             .iter()
             .all(|entry| entry["status"] == "unavailable" && entry.get("usedPct").is_none()));

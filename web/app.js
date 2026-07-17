@@ -69,6 +69,7 @@ let renderedEventCount = 0;
 let eventUiLatencies = [];
 let selectedSessionId;
 let sessionActivityRefs = new Map();
+let attentionExitTimer;
 const SESSION_VISIBLE_FOR_MS = 30 * 60 * 1000;
 
 function element(tag, className, text) {
@@ -110,7 +111,7 @@ function openItems() {
 }
 
 function recentOutcome() {
-  const finalStates = new Set(["confirmed", "resolved", "passed_through", "expired"]);
+  const finalStates = new Set(["confirmed", "resolved", "passed_through", "expired", "dismissed"]);
   return snapshot.attention
     .filter((item) => finalStates.has(item.state))
     .sort((a, b) => b.createdAt - a.createdAt)[0];
@@ -445,6 +446,7 @@ function stateLabel(state) {
     passed_through: "已交回终端",
     expired: "已过期，交回终端",
     snoozed: "稍后提醒",
+    dismissed: "已忽略",
   }[state] || state;
 }
 
@@ -547,15 +549,18 @@ function renderAttention() {
         if (window.confirm("这是高影响操作。确认仍要批准这一次请求？")) sendAction(item, "approve");
       });
       actions.append(approve);
+      actions.append(actionButton("忽略", "ghost", "dismiss", item));
     } else {
       actions.append(actionButton("批准", "", "approve", item));
       actions.append(actionButton("不行", "deny", "deny", item));
       actions.append(actionButton("去终端处理", "ghost", "pass_through", item));
+      actions.append(actionButton("忽略", "ghost", "dismiss", item));
     }
   } else if (item.state === "open") {
     const acknowledge = item.kind === "completion" ? "没问题，收工" : "标记已解决";
     actions.append(actionButton(acknowledge, "", "ack", item));
     actions.append(actionButton("待会提醒", "ghost", "snooze", item));
+    actions.append(actionButton("忽略", "ghost", "dismiss", item));
   } else if (item.state === "committing") {
     const command = latestCommand(item);
     if (command && command.state === "pending_commit") {
@@ -593,12 +598,30 @@ function sessionStatus(session) {
   return { label: "在跑", className: "" };
 }
 
-function elapsedText(since) {
-  const seconds = Math.max(0, Math.floor((Date.now() - Number(since || Date.now())) / 1000));
+function elapsedText(since, until = Date.now()) {
+  const seconds = Math.max(0, Math.floor((Number(until) - Number(since || until)) / 1000));
   if (seconds < 60) return `${seconds} 秒`;
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function turnTiming(session) {
+  const started = Number(session.turnStartedAt || session.activitySince || session.lastEventAt);
+  const ended = Number(session.turnEndedAt || Date.now());
+  const total = elapsedText(started, ended);
+  const active = !session.turnEndedAt && !["idle", "response_finished", "failed"].includes(session.execState);
+  const stage = active && Number(session.activitySince || 0) > started
+    ? ` · 当前阶段 ${elapsedText(session.activitySince)}`
+    : "";
+  return `本轮 ${total}${stage}`;
+}
+
+function compactCount(value) {
+  const count = Number(value || 0);
+  if (count >= 1_000_000) return `${Math.round(count / 100_000) / 10}m`;
+  if (count >= 1_000) return `${Math.round(count / 100) / 10}k`;
+  return String(count);
 }
 
 function visibleSessions() {
@@ -609,7 +632,10 @@ function visibleSessions() {
   );
   const cutoff = Date.now() - SESSION_VISIBLE_FOR_MS;
   return snapshot.sessions
-    .filter((session) => Number(session.lastEventAt || 0) >= cutoff || attentionSessions.has(session.id))
+    .filter((session) => {
+      const active = !["idle", "response_finished", "failed"].includes(session.execState);
+      return active || Number(session.lastEventAt || 0) >= cutoff || attentionSessions.has(session.id);
+    })
     .sort((a, b) => {
       if (a.id === selectedSessionId) return -1;
       if (b.id === selectedSessionId) return 1;
@@ -625,26 +651,26 @@ function activityDisplay(session) {
     return {
       className: "waiting",
       marker: "!",
-      text: `等待你处理 · 已等 ${elapsedText(waiting.createdAt)}`,
+      text: `等待你处理 · ${turnTiming(session)} · 已等 ${elapsedText(waiting.createdAt)}`,
     };
   }
-  const elapsed = elapsedText(session.activitySince || session.lastEventAt);
+  const timing = turnTiming(session);
   if (session.execState === "thinking") {
-    return { className: "thinking", marker: "•••", text: `${session.activity || "正在思考"} · ${elapsed}` };
+    return { className: "thinking", marker: "•••", text: `${session.activity || "正在思考"} · ${timing}` };
   }
   if (session.execState === "tool_running") {
-    return { className: "tool", marker: "▌", text: `${session.activity || "正在运行工具"} · ${elapsed}` };
+    return { className: "tool", marker: "▌", text: `${session.activity || "正在运行工具"} · ${timing}` };
   }
   if (session.execState === "compacting") {
-    return { className: "compacting", marker: "◌", text: `${session.activity || "正在压缩记忆"} · ${elapsed}` };
+    return { className: "compacting", marker: "◌", text: `${session.activity || "正在压缩记忆"} · ${timing}` };
   }
   if (session.execState === "failed") {
-    return { className: "failed", marker: "×", text: session.activity || "运行失败" };
+    return { className: "failed", marker: "×", text: `${session.activity || "运行失败"} · ${timing}` };
   }
   if (session.execState === "response_finished") {
-    return { className: "idle", marker: "✓", text: `${session.activity || "本轮已完成"} · ${elapsed}前` };
+    return { className: "idle", marker: "✓", text: `${session.activity || "本轮已完成"} · ${timing}` };
   }
-  return { className: "idle", marker: "·", text: `${session.activity || "空闲"} · ${elapsed}前` };
+  return { className: "idle", marker: "·", text: `${session.activity || "空闲"} · ${elapsedText(session.lastEventAt)}前` };
 }
 
 function updateSessionActivity() {
@@ -670,6 +696,30 @@ function selectSession(sessionId) {
   });
 }
 
+async function jumpSession(session) {
+  if (!session || session.jumpCapability === "unsupported") {
+    showToast("当前环境不支持跳转；Flow Agent 不会假装已经定位到原对话");
+    return;
+  }
+  try {
+    const result = await api(`/api/v1/sessions/${encodeURIComponent(session.id)}/jump`, {
+      method: "POST",
+      body: "{}",
+    });
+    if (result.success) showToast(result.label || session.jumpLabel || "已打开 Agent");
+  } catch (error) {
+    const message = error.message === "JUMP_FAILED"
+      ? "没有找到原窗口，或 macOS 尚未授予应用控制权限"
+      : `跳转失败：${error.message}`;
+    showToast(message);
+  }
+}
+
+function activateSession(session) {
+  selectSession(session.id);
+  void jumpSession(session);
+}
+
 function renderSessions() {
   ui.sessionList.replaceChildren();
   sessionActivityRefs = new Map();
@@ -688,27 +738,40 @@ function renderSessions() {
     const row = element("article", `session-row${session.id === selectedSessionId ? " selected" : ""}`);
     row.dataset.sessionId = session.id;
     row.tabIndex = 0;
-    row.addEventListener("click", () => selectSession(session.id));
+    row.addEventListener("click", () => activateSession(session));
     row.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        selectSession(session.id);
+        activateSession(session);
       }
     });
     const top = element("div", "row-top");
     top.append(providerIcon(session.provider));
     const copy = element("div", "row-copy");
     const title = element("div", "row-title");
-    title.append(element("strong", "", session.title || "等待下一条任务"));
+    const clientTitle = session.providerTitle || session.title || "等待下一条任务";
+    title.append(element("strong", "", clientTitle));
     title.append(element("span", `state-pill ${status.className}`.trim(), status.label));
-    const meta = element("div", "session-meta", providerName(session.provider));
-    if (session.project) meta.append(element("span", "", ` · ${session.project}`));
+    const taskContent = session.providerTitle && session.title && session.providerTitle !== session.title
+      ? element("div", "session-question", session.title)
+      : undefined;
+    const model = session.model ? element("div", "session-meta", session.model) : undefined;
+    const jump = element("button", `session-jump ${session.jumpCapability || "unsupported"}`, session.jumpLabel || "当前环境不支持跳转");
+    jump.type = "button";
+    jump.disabled = session.jumpCapability === "unsupported";
+    jump.addEventListener("click", (event) => {
+      event.stopPropagation();
+      activateSession(session);
+    });
     const activity = element("div", "row-subtitle session-activity");
     const marker = element("span", "activity-marker");
     const activityText = element("span", "activity-copy");
     activity.append(marker, activityText);
     sessionActivityRefs.set(session.id, { root: activity, marker, text: activityText });
-    copy.append(title, meta, activity);
+    copy.append(title);
+    if (taskContent) copy.append(taskContent);
+    if (model) copy.append(model);
+    copy.append(jump, activity);
     if (Number.isInteger(session.planDone) && Number.isInteger(session.planTotal) && session.planTotal > 0) {
       const progress = element("div", "plan-progress");
       const label = element("span", "", `计划 ${session.planDone}/${session.planTotal}`);
@@ -730,38 +793,40 @@ function renderSessions() {
   updateSessionActivity();
 }
 
-function quotaWindowLabel(provider, windowName) {
-  if (provider === "claude" && windowName === "5h") return "Claude · 5 小时";
-  if (provider === "claude" && windowName === "7d") return "Claude · 7 天";
-  if (provider === "codex") return "Codex · 本周";
-  return `${providerName(provider)} · ${windowName || "额度"}`;
+function quotaDurationLabel(minutes, fallback) {
+  const value = Number(minutes || 0);
+  if (value > 0 && value % 43200 === 0) return `${value / 43200} 个月`;
+  if (value > 0 && value % 10080 === 0) return `${value / 10080} 周`;
+  if (value > 0 && value % 1440 === 0) return `${value / 1440} 天`;
+  if (value > 0 && value % 60 === 0) return `${value / 60} 小时`;
+  if (value > 0) return `${value} 分钟`;
+  if (fallback === "5h") return "5 小时";
+  if (fallback === "7d") return "7 天";
+  return fallback && fallback !== "unknown" ? fallback.replaceAll("_", " ") : "额度";
+}
+
+function quotaWindowLabel(quota) {
+  const name = quota.limitName || quotaDurationLabel(quota.windowMinutes, quota.window);
+  return `${providerName(quota.provider)} · ${name}`;
 }
 
 function quotaSlots() {
-  const expected = [
-    { provider: "claude", window: "5h" },
-    { provider: "claude", window: "7d" },
-    { provider: "codex", window: "week" },
-  ];
-  return expected.map((slot) => {
-    const match = snapshot.quota.find((quota) => {
-      if (quota.provider !== slot.provider) return false;
-      if (slot.provider === "codex") return ["week", "7d", "10080m"].includes(quota.window);
-      return quota.window === slot.window;
-    });
-    return match || {
-      ...slot,
-      status: "unavailable",
-      reason: "这个额度窗口暂时没有返回可验证数据",
-    };
+  return [...(snapshot.quota || [])].sort((a, b) => {
+    const providerOrder = { claude: 0, codex: 1 };
+    return (providerOrder[a.provider] ?? 9) - (providerOrder[b.provider] ?? 9)
+      || Number(a.windowMinutes || Number.MAX_SAFE_INTEGER) - Number(b.windowMinutes || Number.MAX_SAFE_INTEGER)
+      || String(a.window).localeCompare(String(b.window));
   });
 }
 
 function renderQuota() {
   ui.quotaList.replaceChildren();
   for (const quota of quotaSlots()) {
-    const label = quotaWindowLabel(quota.provider, quota.window);
-    if (quota.status !== "available" || typeof quota.usedPct !== "number" || typeof quota.remainingPct !== "number") {
+    const label = quotaWindowLabel(quota);
+    const hasLastValue = ["available", "stale"].includes(quota.status)
+      && typeof quota.usedPct === "number"
+      && typeof quota.remainingPct === "number";
+    if (!hasLastValue) {
       const unavailable = element("article", "quota-unavailable");
       unavailable.append(element("strong", "", label));
       unavailable.append(element("p", "", quota.reason || "额度来源没有返回可验证数据"));
@@ -775,7 +840,7 @@ function renderQuota() {
       ui.quotaList.append(unavailable);
       continue;
     }
-    const row = element("article", "quota-row");
+    const row = element("article", `quota-row${quota.status === "stale" ? " stale" : ""}`);
     const title = element("div", "row-title");
     title.append(element("strong", "", label));
     title.append(element("span", "section-meta", `剩余 ${Math.round(quota.remainingPct)}%`));
@@ -787,9 +852,14 @@ function renderQuota() {
     track.append(fill);
     row.append(track);
     const meta = element("div", "quota-meta");
+    if (quota.status === "stale") meta.append(element("span", "quota-stale", "保留上次有效值"));
+    if (quota.planType) meta.append(element("span", "", quota.planType));
     if (quota.resetsAt) {
       const reset = new Date(Number(quota.resetsAt) * 1000);
-      meta.append(element("span", "", `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`));
+      const resetLabel = reset.getTime() <= Date.now()
+        ? "已到重置时间，等待同步"
+        : `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} 重置`;
+      meta.append(element("span", "", resetLabel));
     }
     if (quota.capturedAt) {
       const minutes = Math.floor((Date.now() - Number(quota.capturedAt)) / 60000);
@@ -849,9 +919,24 @@ function processNotifications(nextSnapshot) {
 }
 
 function render(nextSnapshot) {
+  const previousOpenIds = new Set(openItems().map((item) => item.id));
+  const nextOpenIds = new Set(
+    (nextSnapshot.attention || [])
+      .filter((item) => ["open", "committing", "decision_sent"].includes(item.state))
+      .map((item) => item.id),
+  );
+  const attentionWasResolved = [...previousOpenIds].some((id) => !nextOpenIds.has(id));
   processNotifications(nextSnapshot);
   snapshot = nextSnapshot;
-  renderAttention();
+  if (attentionWasResolved && !attentionExitTimer) {
+    ui.attentionList.querySelector(".attention-card")?.classList.add("attention-card-leaving");
+    attentionExitTimer = window.setTimeout(() => {
+      attentionExitTimer = undefined;
+      renderAttention();
+    }, 180);
+  } else if (!attentionExitTimer) {
+    renderAttention();
+  }
   renderSessions();
   renderQuota();
   ui.eventCount.textContent = String(snapshot.stats?.eventCount || 0);

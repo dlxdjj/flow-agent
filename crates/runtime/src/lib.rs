@@ -5,6 +5,7 @@ mod fsutil;
 mod instance;
 mod spool;
 mod storage;
+mod title;
 mod waiter;
 
 pub use diagnostics::{

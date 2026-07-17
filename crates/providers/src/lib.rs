@@ -61,6 +61,7 @@ fn normalize_event(provider: Provider, event_name: &str) -> EventKind {
         "PostToolUse" | "AfterAgent" => EventKind::ToolFinished,
         "PostToolUseFailure" => EventKind::ToolFailed,
         "PermissionRequest" if provider != Provider::Gemini => EventKind::PermissionRequested,
+        "PermissionDenied" if provider != Provider::Gemini => EventKind::PermissionDenied,
         "Notification" => EventKind::Notification,
         "SubagentStart" => EventKind::SubagentStarted,
         "SubagentStop" => EventKind::SubagentStopped,

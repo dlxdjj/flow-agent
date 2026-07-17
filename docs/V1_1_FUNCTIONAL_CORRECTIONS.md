@@ -1,20 +1,19 @@
 # v1.1 functional-correction verification
 
-Status: eligible for the requested user-test branch push. The current tree's
-116-test workspace gate, release build, desktop-only integration test, and five
-user-requested repeat rounds passed on 2026-07-16. The preceding functional
-correction also passed its user-amended 2-minute resource gate, was installed
-locally, passed all 14 doctor checks, and was visually accepted. This record
-does not satisfy or replace the separate 48-hour final release soak.
+Status: M6-M9 implementation and automated gates complete; the exact release is
+installed locally and the user authorized a local commit on 2026-07-17. GitHub
+push remains forbidden until the user separately authorizes upload after final
+local acceptance.
 
 ## User contract
 
 The main product surface must obey these visible rules:
 
-1. Quota has exactly three independent slots: Claude 5h, Claude 7d, and Codex
-   week.
-2. Agent task titles describe the current task, not the user, Provider, or
-   project.
+1. Quota renders every structurally valid Provider window and preserves the
+   last valid sample instead of hiding it after 30 minutes.
+2. Agent task cards use the verified Provider conversation title as the main
+   title, the bounded current question as plain second-line content, and only
+   the current model as the third line.
 3. Agent rows show factual live thinking/tool/waiting time when events exist,
    and an honest lower-resolution state when they do not.
 4. The main Agent list contains active sessions, sessions with attention, and
@@ -27,6 +26,13 @@ The main product surface must obey these visible rules:
    letter monograms.
 8. A user with only Claude.app and ChatGPT/Codex.app can install and verify
    hooks without installing global `claude` or `codex` commands.
+9. Provider-side approval, denial, or turn completion resolves matching
+   attention and removes stale `等你` state.
+10. Jump labels describe only real capability: exact conversation, matching
+    terminal, application only, or unsupported.
+11. Provider conversation title and current task are separate: the verified
+    local Claude/Codex conversation title is the visible main title, while the
+    bounded current prompt remains visible without a synthetic label.
 
 ## Reference decisions
 
@@ -45,6 +51,11 @@ Adopted lessons:
   activity/session modeling reinforced the existing local-only, event-derived
   design. Flow Agent keeps a strict schema allowlist and does not read response
   text to construct quota.
+- CodeIsland's local title-store design and Open Vibe Island's Codex App Server
+  thread metadata confirmed that client titles are separate from prompts. Flow
+  Agent uses the lower-risk local index/Hook path instead of starting a second
+  Provider subprocess: official Claude `session_title`, bounded Claude
+  custom/AI title records, and Codex's bounded `session_index.jsonl` tail.
 - Both references treat missing or stale local data as unavailable instead of
   inventing a percentage or a running state. This remains a hard UI rule.
 - CodeIsland's MIT Provider icon assets are used only after optimization and
@@ -54,36 +65,43 @@ Adopted lessons:
 
 ### Runtime and session list
 
-- SQLite schema version 2 adds a nullable session title. Existing version-1
-  databases migrate in place without losing sessions.
+- SQLite schema version 5 adds bounded task usage, private jump locators, and
+  separate Provider title/source fields.
+  Existing databases migrate in place without losing sessions.
 - `UserPromptSubmit` stores only a normalized, single-line, maximum-64-character
   task summary. The full prompt and text after the bounded summary are not
   persisted in the session snapshot or event payload.
-- Snapshots expose `activitySince`. The server reconciles liveness every 30
-  seconds and filters the main list to activity within 30 minutes, unless a
-  session still owns an open, committing, sent, or snoozed attention item.
+- Snapshots expose current-turn start/end, real usage when supplied, and a
+  four-level jump descriptor. Private window locators are excluded from JSON.
 - Pending attention therefore cannot disappear just because its session is
   old. Ordinary completed history no longer occupies the live list forever.
+- The title resolver stores only a normalized title and source. Claude
+  transcript reads are limited to 64 KiB at each edge; Codex index reads are
+  limited to a 2 MiB tail. Raw transcript text and its path are never exposed
+  in the snapshot. Recent titles refresh at most once every two seconds, and an
+  official Claude session title cannot be downgraded by an older AI title.
 
 ### UI linkage and activity
 
-- The task title uses `session.title`; Provider and project remain secondary
-  metadata.
+- `session.providerTitle` is the verified local main title when present, while
+  `session.title` is the plain bounded current-question line. The following
+  line contains only `session.model`; project, Provider name, title provenance,
+  and Token usage are not rendered in the card's title stack.
 - A selected attention item selects the matching session, sorts it first,
   highlights it, and scrolls/focuses it into view.
-- A one-second text-only tick updates elapsed activity without rebuilding the
-  row DOM. The visible state distinguishes thinking, current tool, waiting,
-  completed, failed, and idle facts.
+- A one-second text-only tick uses current-turn total time as the primary timer
+  and current-phase time as secondary context.
 - First-run UI installation enables Codex tool-level activity. Command-line
   installation remains low-noise by default and has an explicit enhanced flag.
 
 ### Quota and custom status line
 
-- Backend and frontend both materialize Claude 5h, Claude 7d, and Codex week as
-  separate slots. A missing source or window affects only that slot.
-- Codex accepts only sanitized, fixture-tested rollout families 0.144.2
-  (desktop), 0.144.4, and 0.144.5. Only the 10080-minute window maps to Codex
-  week.
+- Backend and frontend render all structurally valid windows and their actual
+  durations/names. No account is forced into a “week” label.
+- Codex scans bounded rollout tails and validates values rather than patch
+  version; primary and secondary windows are both retained.
+- Samples older than 30 minutes keep their real percentage/reset time and are
+  marked as the last valid value.
 - Claude normally retains the five-minute polling budget, but a cache file
   appearing or changing invalidates an earlier unavailable snapshot
   immediately. The UI therefore does not wait five minutes after the first
@@ -113,35 +131,33 @@ Adopted lessons:
 
 | Gate | Result |
 | --- | --- |
-| `cargo test -p flow-agent-runtime --test m1_runtime --offline` | PASS, 19 tests including migration/title privacy |
-| `cargo test -p flow-agent-quota --lib --offline` | PASS, 7 tests including 0.144.2 desktop, 0.144.5, and fixed slots |
+| `cargo test -p flow-agent-runtime --test m1_runtime --offline` | PASS, 25 tests including title provenance, migration, restart, usage, and jump privacy |
+| `cargo test -p flow-agent-quota --lib --offline` | PASS, 7 tests including dynamic windows and stale-value retention |
 | `cargo test -p flow-agent-installer --test m4_statusline --offline` | PASS, 4 tests including wrapper/restore |
-| `cargo test -p flow-agent-server --lib --offline` | PASS, 7 tests including immediate Claude cache refresh |
+| `cargo test -p flow-agent-server --lib --offline` | PASS, 8 tests including jump target truthfulness and immediate Claude cache refresh |
 | `cargo test -p flow-agent-server --test m2_api --offline` | PASS, 3 authenticated API cases |
-| `cargo test -p flow-agent --test m2_widget_e2e --offline` | PASS |
+| `cargo test -p flow-agent --test m2_widget_e2e --offline` | PASS, 5 Claude + 5 Codex control flows |
 | `cargo clippy --workspace --all-targets --offline -- -D warnings` | PASS, zero warnings |
-| `cargo test --workspace --offline` | PASS, 116 tests and all doc-tests |
+| `cargo test --workspace --offline` | PASS, 127 tests, one explicit resource test ignored by default, and all doc-tests |
 | `cargo build --workspace --release --offline` | PASS |
-| desktop-only install/Onboarding/Doctor suite, repeated per user request | PASS, 5/5 rounds, 40/40 cases |
-| release Doctor with provider CLI paths removed | PASS, Claude.app and ChatGPT bundled Codex 0.144.5 detected |
 | `node --check web/app.js` | PASS |
-| `./scripts/m0-e2e.sh` | PASS, Claude allow, Codex deny, pass-through, missing-Runtime fail-open |
-| event-to-WebSocket performance | PASS, p95 104.483 ms, budget 300 ms |
-| preceding correction's 120-second resource gate | PASS, 118 samples, CPU 0.000%, RSS max 5,440 KiB |
+| event-to-WebSocket performance | PASS, below 300 ms budget |
+| five-round Claude + Codex widget control replay | PASS after isolating its Runtime/home from the user's live instance |
+| explicit 120-second release resource gate | PASS, 118 samples, CPU 0.000%, RSS max 5,616 KiB |
+| install exact release + Doctor on user home | INSTALLED; Runtime/control loop and real Claude/Codex event checks PASS; Codex requires the official `/hooks` re-trust after reinstall |
+| user release decision | Local commit authorized on 2026-07-17; Codex re-trust and explicit GitHub upload approval remain pending |
 
-The in-app browser integration failed before navigation with the external
-error `Cannot redefine property: process`. Per its control contract, no
-standalone browser automation was substituted. The user instead tested the
-installed exact release page and accepted its current functionality and
-visuals on 2026-07-16.
-
-The resource report from the preceding accepted correction binary was:
+The resource report from this exact candidate tree is:
 
 ```json
-{"schemaVersion":1,"durationSeconds":120,"sampleCount":118,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":5440,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}
+{"schemaVersion":1,"durationSeconds":120,"sampleCount":118,"idleCpuAveragePct":0.000,"runtimeRssMaxKiB":5616,"cpuBudgetPct":0.5,"rssBudgetKiB":81920}
 ```
 
 ## Remaining release gate
 
-- keep the final 48-hour release soak unchecked until it actually passes; this
-  branch push is a user-test candidate, not a final v1 release.
+- exact current release is installed and running; the live page renders the
+  Codex client title separately from the current prompt with no console errors;
+- complete the official Codex `/hooks` re-trust and obtain explicit user
+  acceptance;
+- do not commit or push until the user authorizes upload after local testing;
+- keep the final 48-hour release soak unchecked until it actually passes.

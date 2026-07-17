@@ -14,7 +14,6 @@ use thiserror::Error;
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_SOURCE: &str = "statusline";
 const CODEX_SOURCE: &str = "rollout_experimental";
-const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.144.2", "0.144.4", "0.144.5"];
 const FRESH_FOR_MS: u64 = 30 * 60 * 1_000;
 const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 const MAX_STATUSLINE_BYTES: u64 = 256 * 1_024;
@@ -49,6 +48,14 @@ pub struct QuotaEntry {
     pub resets_at: Option<u64>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -72,6 +79,10 @@ impl QuotaEntry {
             remaining_pct: Some(100.0 - used_pct),
             resets_at: Some(resets_at),
             source: source.to_owned(),
+            window_minutes: None,
+            limit_id: None,
+            limit_name: None,
+            plan_type: None,
             captured_at: Some(captured_at),
             reason: None,
         }
@@ -86,24 +97,35 @@ impl QuotaEntry {
             remaining_pct: None,
             resets_at: None,
             source: source.to_owned(),
+            window_minutes: None,
+            limit_id: None,
+            limit_name: None,
+            plan_type: None,
             captured_at: None,
             reason: Some(reason.into()),
         }
     }
 
-    fn stale(provider: &str, window: &str, source: &str, captured_at: u64, now_ms: u64) -> Self {
+    fn with_metadata(
+        mut self,
+        window_minutes: Option<u64>,
+        limit_id: Option<String>,
+        limit_name: Option<String>,
+        plan_type: Option<String>,
+    ) -> Self {
+        self.window_minutes = window_minutes;
+        self.limit_id = limit_id;
+        self.limit_name = limit_name;
+        self.plan_type = plan_type;
+        self
+    }
+
+    fn mark_stale(mut self, now_ms: u64) -> Self {
+        let captured_at = self.captured_at.unwrap_or_default();
         let minutes = now_ms.saturating_sub(captured_at) / 60_000;
-        Self {
-            provider: provider.to_owned(),
-            window: window.to_owned(),
-            status: "stale".to_owned(),
-            used_pct: None,
-            remaining_pct: None,
-            resets_at: None,
-            source: source.to_owned(),
-            captured_at: Some(captured_at),
-            reason: Some(format!("数据已过期（{minutes} 分钟前）")),
-        }
+        self.status = "stale".to_owned();
+        self.reason = Some(format!("最后一次有效数据（{minutes} 分钟前）"));
+        self
     }
 }
 
@@ -209,119 +231,83 @@ impl QuotaCollector {
                 "额度缓存时间晚于本机时间",
             );
         }
-        if now_ms.saturating_sub(cache.captured_at) > FRESH_FOR_MS {
-            return ["5h", "7d"]
-                .into_iter()
-                .map(|window| {
-                    QuotaEntry::stale("claude", window, CLAUDE_SOURCE, cache.captured_at, now_ms)
-                })
-                .collect();
-        }
-        ["5h", "7d"]
+        let stale = now_ms.saturating_sub(cache.captured_at) > FRESH_FOR_MS;
+        let entries = cache
+            .windows
             .into_iter()
-            .map(|expected| {
-                cache
-                    .windows
-                    .iter()
-                    .find(|window| {
-                        window.window == expected
-                            && window.used_pct.is_finite()
-                            && (0.0..=100.0).contains(&window.used_pct)
-                            && window.resets_at > 0
-                    })
-                    .map(|window| {
-                        QuotaEntry::available(
-                            "claude",
-                            expected,
-                            window.used_pct,
-                            window.resets_at,
-                            CLAUDE_SOURCE,
-                            cache.captured_at,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        QuotaEntry::unavailable(
-                            "claude",
-                            expected,
-                            CLAUDE_SOURCE,
-                            "额度缓存没有这个窗口",
-                        )
-                    })
+            .filter(|window| {
+                !window.window.is_empty()
+                    && window.used_pct.is_finite()
+                    && (0.0..=100.0).contains(&window.used_pct)
+                    && window.resets_at > 0
             })
-            .collect()
+            .map(|window| {
+                let entry = QuotaEntry::available(
+                    "claude",
+                    window.window,
+                    window.used_pct,
+                    window.resets_at,
+                    CLAUDE_SOURCE,
+                    cache.captured_at,
+                )
+                .with_metadata(window.window_minutes, None, window.label, None);
+                if stale {
+                    entry.mark_stale(now_ms)
+                } else {
+                    entry
+                }
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            unavailable_windows(
+                "claude",
+                CLAUDE_SOURCE,
+                &["5h", "7d"],
+                "额度缓存没有可验证窗口",
+            )
+        } else {
+            entries
+        }
     }
 
     pub fn collect_codex(&self, now_ms: u64) -> Vec<QuotaEntry> {
         let mut files = Vec::new();
         collect_rollouts(&self.paths.codex_sessions, 0, &mut files);
         files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let Some((path, modified_at)) = files.into_iter().next() else {
+        if files.is_empty() {
             return vec![QuotaEntry::unavailable(
                 "codex",
-                "week",
+                "unknown",
                 CODEX_SOURCE,
                 "未找到 Codex rollout 文件",
             )];
-        };
-        let version = match read_codex_version(&path) {
-            Ok(Some(version)) => version,
-            Ok(None) => {
-                return vec![QuotaEntry::unavailable(
-                    "codex",
-                    "week",
-                    CODEX_SOURCE,
-                    "rollout 缺少版本信息",
-                )]
+        }
+        for (path, modified_at) in files {
+            if modified_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+                || read_codex_version(&path).ok().flatten().is_none()
+            {
+                continue;
             }
-            Err(_) => {
-                return vec![QuotaEntry::unavailable(
-                    "codex",
-                    "week",
-                    CODEX_SOURCE,
-                    "rollout 无法读取",
-                )]
+            let Ok(mut entries) = read_codex_limits(&path, modified_at) else {
+                continue;
+            };
+            if entries.is_empty() {
+                continue;
             }
-        };
-        if !SUPPORTED_CODEX_VERSIONS.contains(&version.as_str()) {
-            return vec![QuotaEntry::unavailable(
-                "codex",
-                "week",
-                CODEX_SOURCE,
-                format!("Codex {version} 的额度结构尚未验证"),
-            )];
+            if now_ms.saturating_sub(modified_at) > FRESH_FOR_MS {
+                entries = entries
+                    .into_iter()
+                    .map(|entry| entry.mark_stale(now_ms))
+                    .collect();
+            }
+            return entries;
         }
-        if modified_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
-            return vec![QuotaEntry::unavailable(
-                "codex",
-                "week",
-                CODEX_SOURCE,
-                "rollout 时间晚于本机时间",
-            )];
-        }
-        if now_ms.saturating_sub(modified_at) > FRESH_FOR_MS {
-            return vec![QuotaEntry::stale(
-                "codex",
-                "week",
-                CODEX_SOURCE,
-                modified_at,
-                now_ms,
-            )];
-        }
-        match read_codex_limits(&path, modified_at) {
-            Ok(entries) if !entries.is_empty() => entries,
-            Ok(_) => vec![QuotaEntry::unavailable(
-                "codex",
-                "week",
-                CODEX_SOURCE,
-                "最新 rollout 没有可用的 rate_limits",
-            )],
-            Err(_) => vec![QuotaEntry::unavailable(
-                "codex",
-                "week",
-                CODEX_SOURCE,
-                "rollout 额度结构解析失败",
-            )],
-        }
+        vec![QuotaEntry::unavailable(
+            "codex",
+            "unknown",
+            CODEX_SOURCE,
+            "rollout 中没有可验证的额度窗口",
+        )]
     }
 }
 
@@ -352,6 +338,10 @@ struct CacheDocument {
 #[serde(rename_all = "camelCase")]
 struct CacheWindow {
     window: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_minutes: Option<u64>,
     used_pct: f64,
     resets_at: u64,
 }
@@ -366,13 +356,10 @@ pub fn capture_claude_statusline(
     }
     let payload: Value = serde_json::from_slice(input)?;
     let mut windows = Vec::new();
-    for (name, pointer) in [
-        ("5h", "/rate_limits/five_hour"),
-        ("7d", "/rate_limits/seven_day"),
-    ] {
-        let Some(window) = payload.pointer(pointer) else {
-            continue;
-        };
+    let Some(rate_limits) = payload.get("rate_limits").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    for (raw_name, window) in rate_limits {
         let Some(used_pct) = window.get("used_percentage").and_then(Value::as_f64) else {
             continue;
         };
@@ -382,8 +369,20 @@ pub fn capture_claude_statusline(
         if !used_pct.is_finite() || !(0.0..=100.0).contains(&used_pct) || resets_at == 0 {
             continue;
         }
+        let Some(name) = claude_window_id(raw_name) else {
+            continue;
+        };
         windows.push(CacheWindow {
-            window: name.to_owned(),
+            window: name.clone(),
+            label: window
+                .get("limit_name")
+                .or_else(|| window.get("name"))
+                .and_then(Value::as_str)
+                .and_then(bounded_label),
+            window_minutes: window
+                .get("window_minutes")
+                .and_then(Value::as_u64)
+                .or_else(|| canonical_window_minutes(&name)),
             used_pct,
             resets_at,
         });
@@ -405,14 +404,15 @@ pub fn capture_claude_statusline(
         .windows
         .into_iter()
         .map(|window| {
-            QuotaEntry::available(
-                "claude",
-                window.window,
-                window.used_pct,
-                window.resets_at,
-                CLAUDE_SOURCE,
-                now_ms,
-            )
+            let CacheWindow {
+                window,
+                label,
+                window_minutes,
+                used_pct,
+                resets_at,
+            } = window;
+            QuotaEntry::available("claude", window, used_pct, resets_at, CLAUDE_SOURCE, now_ms)
+                .with_metadata(window_minutes, None, label, None)
         })
         .collect())
 }
@@ -490,6 +490,8 @@ struct EventPayload {
 #[derive(Debug, Deserialize)]
 struct CodexLimits {
     limit_id: Option<String>,
+    limit_name: Option<String>,
+    plan_type: Option<String>,
     primary: Option<CodexWindow>,
     secondary: Option<CodexWindow>,
 }
@@ -543,9 +545,9 @@ fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, Q
         let Some(limits) = envelope.payload.rate_limits else {
             continue;
         };
-        if limits.limit_id.as_deref().is_some_and(|id| id != "codex") {
-            continue;
-        }
+        let limit_id = limits.limit_id.and_then(|value| bounded_label(&value));
+        let limit_name = limits.limit_name.and_then(|value| bounded_label(&value));
+        let plan_type = limits.plan_type.and_then(|value| bounded_label(&value));
         let mut entries = Vec::new();
         for window in [limits.primary, limits.secondary].into_iter().flatten() {
             if !window.used_percent.is_finite()
@@ -555,21 +557,62 @@ fn read_codex_limits(path: &Path, captured_at: u64) -> Result<Vec<QuotaEntry>, Q
             {
                 continue;
             }
-            if window.window_minutes != 10_080 {
-                continue;
-            }
-            entries.push(QuotaEntry::available(
-                "codex",
-                "week",
-                window.used_percent,
-                window.resets_at,
-                CODEX_SOURCE,
-                captured_at,
-            ));
+            entries.push(
+                QuotaEntry::available(
+                    "codex",
+                    format!("{}m", window.window_minutes),
+                    window.used_percent,
+                    window.resets_at,
+                    CODEX_SOURCE,
+                    captured_at,
+                )
+                .with_metadata(
+                    Some(window.window_minutes),
+                    limit_id.clone(),
+                    limit_name.clone(),
+                    plan_type.clone(),
+                ),
+            );
         }
         return Ok(entries);
     }
     Ok(Vec::new())
+}
+
+fn claude_window_id(value: &str) -> Option<String> {
+    let canonical = match value {
+        "five_hour" => "5h".to_owned(),
+        "seven_day" => "7d".to_owned(),
+        other => other
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+            .take(48)
+            .collect(),
+    };
+    (!canonical.is_empty()).then_some(canonical)
+}
+
+fn canonical_window_minutes(window: &str) -> Option<u64> {
+    match window {
+        "5h" => Some(300),
+        "7d" => Some(10_080),
+        _ => window
+            .strip_suffix('m')
+            .and_then(|minutes| minutes.parse::<u64>().ok())
+            .filter(|minutes| *minutes > 0),
+    }
+}
+
+fn bounded_label(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(64)
+        .collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -733,12 +776,25 @@ mod tests {
           "transcript_path":"/private/transcript.jsonl",
           "rate_limits":{
             "five_hour":{"used_percentage":23.5,"resets_at":1784140000},
-            "seven_day":{"used_percentage":41.2,"resets_at":1784740000}
+            "seven_day":{"used_percentage":41.2,"resets_at":1784740000},
+            "fable":{"used_percentage":9.0,"resets_at":1784800000,"name":"Fable","window_minutes":1440}
           }
         }"#;
         let entries = capture_claude_statusline(payload, &cache, 1_784_130_000_000).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].remaining_pct, Some(76.5));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.window == "5h")
+                .and_then(|entry| entry.remaining_pct),
+            Some(76.5)
+        );
+        let fable = entries
+            .iter()
+            .find(|entry| entry.window == "fable")
+            .unwrap();
+        assert_eq!(fable.limit_name.as_deref(), Some("Fable"));
+        assert_eq!(fable.window_minutes, Some(1_440));
         let saved = fs::read_to_string(&cache).unwrap();
         assert!(!saved.contains("secret-session"));
         assert!(!saved.contains("customer-project"));
@@ -756,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_or_incompatible_claude_cache_never_exposes_a_percentage() {
+    fn stale_claude_cache_preserves_last_value_but_incompatible_data_stays_unavailable() {
         let stale_root = root("stale");
         let paths = QuotaPaths {
             flow_home: stale_root.clone(),
@@ -770,7 +826,9 @@ mod tests {
         .unwrap();
         let stale = QuotaCollector::new(paths.clone()).collect_claude(FRESH_FOR_MS + 2_000);
         assert_eq!(stale[0].status, "stale");
-        assert_eq!(stale[0].used_pct, None);
+        assert_eq!(stale[0].used_pct, Some(50.0));
+        assert_eq!(stale[0].remaining_pct, Some(50.0));
+        assert_eq!(stale[0].resets_at, Some(1_784_140_000));
         fs::write(
             paths.claude_cache(),
             br#"{"schemaVersion":99,"provider":"claude","source":"statusline","capturedAt":1,"windows":[]}"#,
@@ -822,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_rollout_is_exact_version_gated_and_reads_only_limit_records() {
+    fn codex_rollout_is_shape_validated_and_returns_every_limit_window() {
         let root = root("codex");
         write_rollout(
             &root,
@@ -841,9 +899,11 @@ mod tests {
             codex_sessions: root.clone(),
         });
         let entries = collector.collect_codex(now);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].window, "week");
-        assert_eq!(entries[0].remaining_pct, Some(56.0));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].window, "300m");
+        assert_eq!(entries[0].remaining_pct, Some(88.0));
+        assert_eq!(entries[1].window, "10080m");
+        assert_eq!(entries[1].remaining_pct, Some(56.0));
 
         write_rollout(&root, "0.145.0", "null");
         let incompatible = collector.collect_codex(now + 1);
@@ -852,7 +912,7 @@ mod tests {
             .reason
             .as_deref()
             .unwrap()
-            .contains("尚未验证"));
+            .contains("没有可验证"));
         assert_eq!(incompatible[0].used_pct, None);
     }
 
@@ -878,9 +938,11 @@ mod tests {
             codex_sessions: root.clone(),
         })
         .collect_codex(captured_at);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].used_pct, Some(44.0));
-        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].used_pct, Some(12.0));
+        assert_eq!(entries[0].window, "300m");
+        assert_eq!(entries[1].used_pct, Some(44.0));
+        assert_eq!(entries[1].window, "10080m");
 
         let future = QuotaCollector::new(QuotaPaths {
             flow_home: root.join("future-flow"),
@@ -922,7 +984,7 @@ mod tests {
         })
         .collect_codex(captured_at);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries[0].window, "10080m");
         assert_eq!(entries[0].used_pct, Some(8.0));
         assert_eq!(entries[0].remaining_pct, Some(92.0));
     }
@@ -951,7 +1013,7 @@ mod tests {
         })
         .collect_codex(captured_at);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].window, "week");
+        assert_eq!(entries[0].window, "10080m");
         assert_eq!(entries[0].used_pct, Some(49.0));
         assert_eq!(entries[0].remaining_pct, Some(51.0));
     }

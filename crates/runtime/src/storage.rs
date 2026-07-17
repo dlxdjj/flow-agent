@@ -1,4 +1,7 @@
 use crate::fsutil::ensure_private_directory;
+use crate::title::{
+    resolve_codex_session_titles, resolve_event_title, resolve_session_title, ProviderTitle,
+};
 use flow_agent_core::{BridgeRequest, Decision, EventKind, Provider, PERMISSION_COMMIT_DELAY_MS};
 use flow_agent_providers::parse_hook;
 use rusqlite::types::ValueRef;
@@ -17,8 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_TASK_TITLE_CHARS: usize = 64;
+const PROVIDER_TITLE_REFRESH_INTERVAL_MS: u64 = 2_000;
+const PROVIDER_TITLE_ACTIVE_WINDOW_MS: u64 = 30 * 60 * 1_000;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -51,6 +56,7 @@ pub enum ApprovalAction {
 pub enum AttentionAction {
     Ack,
     Snooze,
+    Dismiss,
 }
 
 impl AttentionAction {
@@ -58,6 +64,7 @@ impl AttentionAction {
         match self {
             Self::Ack => "ack",
             Self::Snooze => "snooze",
+            Self::Dismiss => "dismiss",
         }
     }
 }
@@ -153,6 +160,8 @@ pub struct SessionRecord {
     pub provider_session_id: String,
     pub project: Option<String>,
     pub title: Option<String>,
+    pub provider_title: Option<String>,
+    pub provider_title_source: Option<String>,
     pub model: Option<String>,
     pub exec_state: String,
     pub approval_owner: Option<String>,
@@ -160,6 +169,22 @@ pub struct SessionRecord {
     pub activity_since: Option<u64>,
     pub plan_done: Option<u32>,
     pub plan_total: Option<u32>,
+    pub turn_started_at: Option<u64>,
+    pub turn_ended_at: Option<u64>,
+    pub token_total: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub jump_capability: String,
+    pub jump_label: String,
+    #[serde(skip)]
+    pub term_app: Option<String>,
+    #[serde(skip)]
+    pub term_session_id: Option<String>,
+    #[serde(skip)]
+    pub term_tty: Option<String>,
+    #[serde(skip)]
+    pub term_bundle_id: Option<String>,
+    #[serde(skip)]
+    pub term_surface: Option<String>,
     pub last_event_at: u64,
 }
 
@@ -578,6 +603,7 @@ fn writer_loop(
     database_path: PathBuf,
     receiver: mpsc::Receiver<StoreMessage>,
 ) {
+    let mut last_provider_title_refresh_at = 0;
     while let Ok(message) = receiver.recv() {
         match message {
             StoreMessage::Ingest { request, reply } => {
@@ -671,8 +697,16 @@ fn writer_loop(
                 ));
             }
             StoreMessage::Snapshot { reply } => {
-                let result = reopen_due_snoozed(&mut connection, now_millis())
-                    .and_then(|_| read_snapshot(&connection));
+                let now = now_millis();
+                let result = reopen_due_snoozed(&mut connection, now).and_then(|_| {
+                    if now.saturating_sub(last_provider_title_refresh_at)
+                        >= PROVIDER_TITLE_REFRESH_INTERVAL_MS
+                    {
+                        refresh_provider_titles(&mut connection, now)?;
+                        last_provider_title_refresh_at = now;
+                    }
+                    read_snapshot(&connection)
+                });
                 let _ = reply.send(result);
             }
             StoreMessage::ReadSetting { key, reply } => {
@@ -1065,11 +1099,15 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
               id TEXT PRIMARY KEY,
               provider TEXT NOT NULL,
               provider_session_id TEXT NOT NULL,
-              cwd TEXT, project TEXT, title TEXT, model TEXT, permission_mode TEXT,
+              cwd TEXT, project TEXT, title TEXT,
+              provider_title TEXT, provider_title_source TEXT,
+              model TEXT, permission_mode TEXT,
               term_app TEXT, term_session_id TEXT, term_tty TEXT, term_title TEXT,
+              term_bundle_id TEXT, term_surface TEXT,
               exec_state TEXT NOT NULL DEFAULT 'idle',
               approval_owner TEXT, activity TEXT, activity_since INTEGER,
               plan_done INTEGER, plan_total INTEGER,
+              token_total INTEGER, context_window_tokens INTEGER,
               started_at INTEGER NOT NULL, last_event_at INTEGER NOT NULL,
               ended_at INTEGER,
               UNIQUE(provider, provider_session_id)
@@ -1161,6 +1199,9 @@ fn initialize(connection: &Connection) -> Result<(), StoreError> {
         )
         .map_err(storage_error)?;
     ensure_session_title_column(connection)?;
+    ensure_session_provider_title_columns(connection)?;
+    ensure_session_usage_columns(connection)?;
+    ensure_session_locator_columns(connection)?;
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(storage_error)?;
@@ -1180,6 +1221,72 @@ fn ensure_session_title_column(connection: &Connection) -> Result<(), StoreError
         connection
             .execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])
             .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn ensure_session_provider_title_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for column in ["provider_title", "provider_title_source"] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_session_usage_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for column in ["token_total", "context_window_tokens"] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} INTEGER"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_session_locator_columns(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(storage_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(storage_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage_error)?;
+    for column in ["term_bundle_id", "term_surface"] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+                    [],
+                )
+                .map_err(storage_error)?;
+        }
     }
     Ok(())
 }
@@ -1212,6 +1319,13 @@ fn ingest_transaction(
 
     let occurred_at = to_i64(request.received_at);
     let task_title = task_title(&request.raw, parsed.kind);
+    let provider_title = resolve_event_title(
+        request.provider,
+        &request.raw,
+        &parsed.provider_session_id,
+        parsed.cwd.as_deref(),
+    );
+    let (token_total, context_window_tokens) = normalized_token_usage(&request.raw);
     let provider = request.provider.to_string();
     let existing = transaction
         .query_row(
@@ -1238,10 +1352,12 @@ fn ingest_transaction(
         transaction
             .execute(
                 "INSERT INTO sessions (
-                   id, provider, provider_session_id, cwd, project, title, model,
+                   id, provider, provider_session_id, cwd, project, title,
+                   provider_title, provider_title_source, model,
                    permission_mode, term_app, term_session_id, term_tty, term_title,
+                   term_bundle_id, term_surface,
                    exec_state, started_at, last_event_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'idle', ?13, ?13)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'idle', ?17, ?17)",
                 params![
                     session_id,
                     provider,
@@ -1249,6 +1365,8 @@ fn ingest_transaction(
                     cwd,
                     project,
                     task_title.as_deref(),
+                    provider_title.as_ref().map(|value| value.title.as_str()),
+                    provider_title.as_ref().map(|value| value.source),
                     parsed.model,
                     parsed.permission_mode,
                     request.term.as_ref().and_then(|value| value.app.as_deref()),
@@ -1261,6 +1379,14 @@ fn ingest_transaction(
                         .term
                         .as_ref()
                         .and_then(|value| value.title.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.bundle_id.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.surface.as_deref()),
                     occurred_at,
                 ],
             )
@@ -1400,6 +1526,15 @@ fn ingest_transaction(
         _ => None,
     };
 
+    reconcile_provider_handled_approval(
+        &transaction,
+        &session_id,
+        turn_id.as_deref(),
+        parsed.kind,
+        parsed.tool_name.as_deref(),
+        occurred_at,
+    )?;
+
     let may_update = occurred_at >= last_event_at
         && (!terminal
             || matches!(
@@ -1429,6 +1564,16 @@ fn ingest_transaction(
                    plan_done = COALESCE(?7, plan_done),
                    plan_total = COALESCE(?8, plan_total),
                    title = COALESCE(?9, title),
+                   provider_title = COALESCE(?10, provider_title),
+                   provider_title_source = COALESCE(?11, provider_title_source),
+                   token_total = COALESCE(?12, token_total),
+                   context_window_tokens = COALESCE(?13, context_window_tokens),
+                   term_app = COALESCE(?14, term_app),
+                   term_session_id = COALESCE(?15, term_session_id),
+                   term_tty = COALESCE(?16, term_tty),
+                   term_title = COALESCE(?17, term_title),
+                   term_bundle_id = COALESCE(?18, term_bundle_id),
+                   term_surface = COALESCE(?19, term_surface),
                    ended_at = CASE WHEN ?6 = 1 THEN ?5 ELSE ended_at END
                  WHERE id = ?1",
                 params![
@@ -1441,25 +1586,47 @@ fn ingest_transaction(
                     plan_progress.map(|(done, _)| i64::from(done)),
                     plan_progress.map(|(_, total)| i64::from(total)),
                     task_title.as_deref(),
+                    provider_title.as_ref().map(|value| value.title.as_str()),
+                    provider_title.as_ref().map(|value| value.source),
+                    token_total.map(to_i64),
+                    context_window_tokens.map(to_i64),
+                    request.term.as_ref().and_then(|value| value.app.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.session_id.as_deref()),
+                    request.term.as_ref().and_then(|value| value.tty.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.title.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.bundle_id.as_deref()),
+                    request
+                        .term
+                        .as_ref()
+                        .and_then(|value| value.surface.as_deref()),
                 ],
             )
             .map_err(storage_error)?;
     }
 
-    if may_update && parsed.kind == EventKind::ToolFinished {
-        confirm_allowed_command(&transaction, &session_id, turn_id.as_deref(), occurred_at)?;
-    }
-    if matches!(parsed.kind, EventKind::Stopped | EventKind::Failed) {
+    if matches!(
+        parsed.kind,
+        EventKind::Stopped | EventKind::Failed | EventKind::SessionEnded
+    ) {
         if let Some(turn_id) = turn_id.as_deref() {
             transaction
                 .execute(
                     "UPDATE turns SET state = ?2, ended_at = ?3 WHERE id = ?1",
                     params![
                         turn_id,
-                        if parsed.kind == EventKind::Failed {
-                            "failed"
-                        } else {
-                            "response_finished"
+                        match parsed.kind {
+                            EventKind::Failed => "failed",
+                            EventKind::SessionEnded => "idle",
+                            _ => "response_finished",
                         },
                         occurred_at
                     ],
@@ -1761,6 +1928,15 @@ fn act_attention_transaction(
                 )
                 .map_err(storage_error)?;
         }
+        AttentionAction::Dismiss => {
+            transaction
+                .execute(
+                    "UPDATE attention_items SET state = 'dismissed', resolved_at = ?2,
+                       resolution = 'user_dismissed', expires_at = NULL WHERE id = ?1",
+                    params![attention_id, to_i64(now)],
+                )
+                .map_err(storage_error)?;
+        }
     }
     transaction
         .execute(
@@ -1955,36 +2131,170 @@ fn reconcile_sessions_transaction(
     Ok(idled)
 }
 
+fn refresh_provider_titles(connection: &mut Connection, now: u64) -> Result<(), StoreError> {
+    let cutoff = to_i64(now.saturating_sub(PROVIDER_TITLE_ACTIVE_WINDOW_MS));
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, provider, provider_session_id, cwd,
+                        provider_title, provider_title_source
+                 FROM sessions
+                 WHERE provider IN ('claude', 'codex')
+                   AND (exec_state != 'idle' OR last_event_at >= ?1)",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows
+    };
+
+    let codex_ids = candidates
+        .iter()
+        .filter(|(_, provider, _, _, _, _)| provider == "codex")
+        .map(|(_, _, provider_session_id, _, _, _)| provider_session_id.clone())
+        .collect::<HashSet<_>>();
+    let codex_titles = resolve_codex_session_titles(&codex_ids);
+    let updates = candidates
+        .into_iter()
+        .filter_map(
+            |(id, provider, provider_session_id, cwd, current_title, current_source)| {
+                let resolved = if provider == "codex" {
+                    codex_titles.get(&provider_session_id).cloned()
+                } else {
+                    resolve_session_title(&provider, &provider_session_id, cwd.as_deref())
+                }?;
+                if !should_refresh_provider_title(
+                    current_title.as_deref(),
+                    current_source.as_deref(),
+                    &resolved,
+                ) {
+                    return None;
+                }
+                Some((id, resolved))
+            },
+        )
+        .collect::<Vec<(String, ProviderTitle)>>();
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction().map_err(storage_error)?;
+    for (id, resolved) in updates {
+        transaction
+            .execute(
+                "UPDATE sessions
+                 SET provider_title = ?2, provider_title_source = ?3
+                 WHERE id = ?1",
+                params![id, resolved.title, resolved.source],
+            )
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(storage_error)?;
+    Ok(())
+}
+
+fn should_refresh_provider_title(
+    current_title: Option<&str>,
+    current_source: Option<&str>,
+    resolved: &ProviderTitle,
+) -> bool {
+    if current_title == Some(resolved.title.as_str()) && current_source == Some(resolved.source) {
+        return false;
+    }
+
+    // SessionStart carries Claude's official current title. A transcript may still contain an
+    // older AI-generated title, so background refreshes must not downgrade that authoritative
+    // value. A later custom-title remains an intentional user rename and may replace either.
+    !matches!(
+        (current_source, resolved.source),
+        (
+            Some("claude_session_title" | "claude_custom_title"),
+            "claude_ai_title"
+        )
+    )
+}
+
 fn read_snapshot(connection: &Connection) -> Result<StoreSnapshot, StoreError> {
     let sessions = {
         let mut statement = connection
             .prepare(
-                "SELECT id, provider, provider_session_id, project, title, model,
+                "SELECT id, provider, provider_session_id, project, title,
+                        provider_title, provider_title_source, model,
                         exec_state, approval_owner, activity, activity_since,
-                        plan_done, plan_total, last_event_at
+                        plan_done, plan_total,
+                        (SELECT started_at FROM turns
+                         WHERE turns.session_id = sessions.id
+                         ORDER BY ordinal DESC LIMIT 1),
+                        (SELECT ended_at FROM turns
+                         WHERE turns.session_id = sessions.id
+                         ORDER BY ordinal DESC LIMIT 1),
+                        token_total, context_window_tokens,
+                        term_app, term_session_id, term_tty,
+                        term_bundle_id, term_surface, last_event_at
                  FROM sessions ORDER BY last_event_at DESC",
             )
             .map_err(storage_error)?;
         let rows = statement
             .query_map([], |row| {
+                let provider = row.get::<_, String>(1)?;
+                let provider_session_id = row.get::<_, String>(2)?;
+                let term_app = row.get::<_, Option<String>>(18)?;
+                let term_session_id = row.get::<_, Option<String>>(19)?;
+                let term_tty = row.get::<_, Option<String>>(20)?;
+                let term_bundle_id = row.get::<_, Option<String>>(21)?;
+                let term_surface = row.get::<_, Option<String>>(22)?;
+                let (jump_capability, jump_label) = jump_descriptor(
+                    &provider,
+                    &provider_session_id,
+                    term_app.as_deref(),
+                    term_session_id.as_deref(),
+                    term_tty.as_deref(),
+                    term_bundle_id.as_deref(),
+                    term_surface.as_deref(),
+                );
                 Ok(SessionRecord {
                     id: row.get(0)?,
-                    provider: row.get(1)?,
-                    provider_session_id: row.get(2)?,
+                    provider,
+                    provider_session_id,
                     project: row.get(3)?,
                     title: row.get(4)?,
-                    model: row.get(5)?,
-                    exec_state: row.get(6)?,
-                    approval_owner: row.get(7)?,
-                    activity: row.get(8)?,
-                    activity_since: row.get::<_, Option<i64>>(9)?.map(from_i64),
+                    provider_title: row.get(5)?,
+                    provider_title_source: row.get(6)?,
+                    model: row.get(7)?,
+                    exec_state: row.get(8)?,
+                    approval_owner: row.get(9)?,
+                    activity: row.get(10)?,
+                    activity_since: row.get::<_, Option<i64>>(11)?.map(from_i64),
                     plan_done: row
-                        .get::<_, Option<i64>>(10)?
+                        .get::<_, Option<i64>>(12)?
                         .and_then(|value| u32::try_from(value).ok()),
                     plan_total: row
-                        .get::<_, Option<i64>>(11)?
+                        .get::<_, Option<i64>>(13)?
                         .and_then(|value| u32::try_from(value).ok()),
-                    last_event_at: from_i64(row.get(12)?),
+                    turn_started_at: row.get::<_, Option<i64>>(14)?.map(from_i64),
+                    turn_ended_at: row.get::<_, Option<i64>>(15)?.map(from_i64),
+                    token_total: row.get::<_, Option<i64>>(16)?.map(from_i64),
+                    context_window_tokens: row.get::<_, Option<i64>>(17)?.map(from_i64),
+                    jump_capability,
+                    jump_label,
+                    term_app,
+                    term_session_id,
+                    term_tty,
+                    term_bundle_id,
+                    term_surface,
+                    last_event_at: from_i64(row.get(23)?),
                 })
             })
             .map_err(storage_error)?
@@ -2206,11 +2516,11 @@ fn insert_approval_attention(
         .execute(
             "INSERT INTO attention_items (
                id, session_id, provider, project, turn_id, request_id, kind,
-               title, command_preview, risk, risk_notes, dedupe_key, state,
+               title, detail, command_preview, risk, risk_notes, dedupe_key, state,
                expires_at, created_at
              ) VALUES (
-               ?1, ?2, ?3, ?4, ?5, ?6, 'approval', ?7, ?8, ?9, ?10, ?6,
-               'open', ?11, ?12
+               ?1, ?2, ?3, ?4, ?5, ?6, 'approval', ?7, ?8, ?9, ?10, ?11, ?6,
+               'open', ?12, ?13
              )",
             params![
                 id,
@@ -2226,6 +2536,7 @@ fn insert_approval_attention(
                         .as_deref()
                         .unwrap_or("此操作")
                 ),
+                approval_detail(&request.raw, tool_name),
                 command.map(redacted_preview),
                 risk,
                 serde_json::to_string(&notes)
@@ -2289,7 +2600,7 @@ fn insert_nonapproval_attention(
                 spec.title,
                 spec.detail
                     .filter(|detail| !detail.trim().is_empty())
-                    .map(|_| "Provider 附加详情已脱敏".to_owned()),
+                    .and_then(sanitized_attention_text),
                 spec.dedupe_key,
                 to_i64(request.received_at),
             ],
@@ -2372,42 +2683,177 @@ fn command_claim(
     .transpose()
 }
 
-fn confirm_allowed_command(
+fn reconcile_provider_handled_approval(
     transaction: &Transaction<'_>,
     session_id: &str,
     turn_id: Option<&str>,
+    kind: EventKind,
+    tool_name: Option<&str>,
     occurred_at: i64,
 ) -> Result<(), StoreError> {
-    let attention_id = transaction
-        .query_row(
-            "SELECT id FROM attention_items
-             WHERE session_id = ?1 AND state = 'decision_sent'
-               AND (?2 IS NULL OR turn_id = ?2)
-               AND resolution = 'approve'
-             ORDER BY created_at DESC LIMIT 1",
-            params![session_id, turn_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(storage_error)?;
-    if let Some(attention_id) = attention_id {
+    let outcome = match kind {
+        EventKind::ToolStarted | EventKind::ToolFinished => "provider_approved",
+        EventKind::ToolFailed | EventKind::PermissionDenied => "provider_denied",
+        EventKind::Stopped
+        | EventKind::Failed
+        | EventKind::SessionEnded
+        | EventKind::PromptSubmitted => "provider_closed",
+        _ => return Ok(()),
+    };
+    let terminal_event = matches!(
+        kind,
+        EventKind::Stopped
+            | EventKind::Failed
+            | EventKind::SessionEnded
+            | EventKind::PromptSubmitted
+            | EventKind::PermissionDenied
+    );
+    let closes_whole_session = matches!(
+        kind,
+        EventKind::Stopped
+            | EventKind::Failed
+            | EventKind::SessionEnded
+            | EventKind::PromptSubmitted
+    );
+    let scoped_turn = if closes_whole_session { None } else { turn_id };
+    let candidates = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, title, resolution FROM attention_items
+                 WHERE session_id = ?1 AND kind = 'approval'
+                   AND state IN ('open', 'committing', 'decision_sent')
+                   AND (?2 IS NULL OR turn_id = ?2)
+                 ORDER BY created_at DESC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![session_id, scoped_turn], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        rows
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    for (attention_id, title, resolution) in candidates {
+        if !terminal_event && resolution.is_none() {
+            let Some(tool_name) = tool_name else { continue };
+            let safe_tool = sanitized_tool_name(tool_name);
+            if safe_tool == "Unknown" || !title.contains(&safe_tool) {
+                continue;
+            }
+        }
+        let confirmed_action = match (outcome, resolution.as_deref()) {
+            ("provider_approved", Some("approve")) => Some("approve"),
+            ("provider_denied", Some("deny")) => Some("deny"),
+            _ => None,
+        };
         transaction
             .execute(
-                "UPDATE attention_items SET state = 'resolved', resolved_at = ?2
+                "UPDATE attention_items SET state = 'resolved', resolved_at = ?2,
+                   expires_at = NULL, resolution = COALESCE(resolution, ?3)
                  WHERE id = ?1",
-                params![attention_id, occurred_at],
+                params![attention_id, occurred_at, outcome],
             )
             .map_err(storage_error)?;
-        transaction
-            .execute(
-                "UPDATE commands SET state = 'confirmed', confirmed_at = ?2
-                 WHERE attention_id = ?1 AND action = 'approve'
-                   AND state = 'decision_sent'",
-                params![attention_id, occurred_at],
-            )
-            .map_err(storage_error)?;
+        if let Some(action) = confirmed_action {
+            transaction
+                .execute(
+                    "UPDATE commands SET state = 'confirmed', confirmed_at = ?2
+                     WHERE attention_id = ?1 AND action = ?3
+                       AND state IN ('pending_commit', 'decision_sent')",
+                    params![attention_id, occurred_at, action],
+                )
+                .map_err(storage_error)?;
+        }
+        if outcome != "provider_closed" {
+            transaction
+                .execute(
+                    "UPDATE commands SET state = 'failed', confirmed_at = ?2,
+                       error_code = 'PROVIDER_HANDLED'
+                     WHERE attention_id = ?1 AND state IN ('pending_commit', 'decision_sent')",
+                    params![attention_id, occurred_at],
+                )
+                .map_err(storage_error)?;
+        }
+        if !terminal_event {
+            break;
+        }
     }
     Ok(())
+}
+
+fn approval_detail(raw: &Value, tool_name: Option<&str>) -> Option<String> {
+    let supplied = ["reason", "description", "message"]
+        .iter()
+        .find_map(|key| raw.get(*key).and_then(Value::as_str))
+        .and_then(sanitized_attention_text);
+    if supplied.is_some() {
+        return supplied;
+    }
+    let tool = tool_name.map(sanitized_tool_name);
+    let input = raw.get("tool_input");
+    match tool.as_deref() {
+        Some("Edit" | "Write" | "Read" | "MultiEdit" | "apply_patch") => input
+            .and_then(|value| {
+                ["file_path", "path"]
+                    .iter()
+                    .find_map(|key| value.get(*key).and_then(Value::as_str))
+            })
+            .and_then(|path| Path::new(path).file_name().and_then(|name| name.to_str()))
+            .map(|name| format!("Agent 请求访问文件 {name}，完整路径请在原对话中核对。")),
+        Some("Bash" | "Shell") => Some(
+            "Agent 请求执行终端命令；这里只展示脱敏摘要，完整内容请在原对话中核对。".to_owned(),
+        ),
+        Some(name) => Some(format!("Agent 请求运行 {name}，请核对操作目的和影响。")),
+        None => None,
+    }
+}
+
+fn sanitized_attention_text(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "api_key",
+        "api-key",
+        "password=",
+        "token=",
+        "secret=",
+        "sk-",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("内容可能包含凭据，已隐藏；请回到原对话查看。".to_owned());
+    }
+    let mut bounded = normalized.chars().take(180).collect::<String>();
+    if normalized.chars().count() > 180 {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn update_task_progress(
@@ -2525,6 +2971,61 @@ fn has_background_work(raw: &Value) -> bool {
     })
 }
 
+fn normalized_token_usage(raw: &Value) -> (Option<u64>, Option<u64>) {
+    let total = first_u64(
+        raw,
+        &[
+            "/token_usage/total_tokens",
+            "/tokenUsage/totalTokens",
+            "/usage/total_tokens",
+            "/usage/totalTokens",
+            "/info/total_token_usage/total_tokens",
+            "/params/tokenUsage/total/totalTokens",
+            "/params/tokenUsage/last/totalTokens",
+        ],
+    )
+    .or_else(|| {
+        let input = first_u64(
+            raw,
+            &[
+                "/usage/input_tokens",
+                "/usage/inputTokens",
+                "/info/total_token_usage/input_tokens",
+            ],
+        )?;
+        let output = first_u64(
+            raw,
+            &[
+                "/usage/output_tokens",
+                "/usage/outputTokens",
+                "/info/total_token_usage/output_tokens",
+            ],
+        )
+        .unwrap_or_default();
+        input.checked_add(output)
+    });
+    let context = first_u64(
+        raw,
+        &[
+            "/model_context_window",
+            "/context_window/max_input_tokens",
+            "/contextWindow",
+            "/params/tokenUsage/modelContextWindow",
+        ],
+    );
+    (
+        total.filter(|value| *value > 0),
+        context.filter(|value| *value > 0),
+    )
+}
+
+fn first_u64(raw: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_u64))
+        .filter(|value| *value <= i64::MAX as u64)
+}
+
 fn task_title(raw: &Value, kind: EventKind) -> Option<String> {
     if kind != EventKind::PromptSubmitted {
         return None;
@@ -2578,6 +3079,7 @@ fn project_event<'a>(
         EventKind::PermissionRequested => {
             ("awaiting_approval", Some("widget"), "等待你批准".to_owned())
         }
+        EventKind::PermissionDenied => ("thinking", None, "操作已在 Agent 中拒绝".to_owned()),
         EventKind::Compacting => ("compacting", None, "正在压缩记忆".to_owned()),
         EventKind::Stopped if has_background_work(raw) => {
             let count = ["background_tasks", "session_crons"]
@@ -2750,6 +3252,7 @@ fn event_type(kind: EventKind) -> &'static str {
         EventKind::ToolFinished => "tool.finished",
         EventKind::ToolFailed => "tool.failed",
         EventKind::PermissionRequested => "approval.requested",
+        EventKind::PermissionDenied => "approval.denied",
         EventKind::Notification => "notification",
         EventKind::SubagentStarted => "subagent.started",
         EventKind::SubagentStopped => "subagent.stopped",
@@ -2760,6 +3263,41 @@ fn event_type(kind: EventKind) -> &'static str {
         EventKind::Failed => "turn.failed",
         EventKind::Unknown => "unknown",
     }
+}
+
+fn jump_descriptor(
+    provider: &str,
+    provider_session_id: &str,
+    term_app: Option<&str>,
+    term_session_id: Option<&str>,
+    term_tty: Option<&str>,
+    term_bundle_id: Option<&str>,
+    term_surface: Option<&str>,
+) -> (String, String) {
+    let app = term_app.unwrap_or_default().to_ascii_lowercase();
+    let bundle = term_bundle_id.unwrap_or_default().to_ascii_lowercase();
+    let codex_app = term_surface == Some("codex_app") || bundle == "com.openai.codex";
+    if provider == "codex" && codex_app && Uuid::parse_str(provider_session_id).is_ok() {
+        return ("exact_conversation".to_owned(), "精确打开对话".to_owned());
+    }
+    let iterm = app.contains("iterm") || bundle == "com.googlecode.iterm2";
+    let terminal = app == "apple_terminal" || bundle == "com.apple.terminal";
+    if (iterm && term_session_id.is_some()) || (terminal && term_tty.is_some()) {
+        return ("terminal".to_owned(), "打开对应终端".to_owned());
+    }
+    let known_app = codex_app
+        || term_surface == Some("claude_app")
+        || bundle == "com.anthropic.claudefordesktop"
+        || iterm
+        || terminal
+        || app == "vscode"
+        || bundle == "com.microsoft.vscode"
+        || app.contains("warp")
+        || bundle.starts_with("dev.warp.");
+    if known_app {
+        return ("app_only".to_owned(), "只能打开应用".to_owned());
+    }
+    ("unsupported".to_owned(), "当前环境不支持跳转".to_owned())
 }
 
 fn project_name(path: &str) -> Option<&str> {
