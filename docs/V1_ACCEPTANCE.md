@@ -1,7 +1,7 @@
 # Flow Agent v1 delivery contract
 
 Source baseline: `WIDGET_V1_PLAN.md` v1.1 dated 2026-07-15, amended by the
-M0 evidence in `REFERENCE_REVIEW.md` and `M0_PROVIDER_REPORT.md`. This
+M0-M13 verification records and summarized in `STATUS.md`. This
 repository file keeps the milestone gates next to the implementation; it does
 not weaken or replace the full plan.
 
@@ -94,34 +94,62 @@ not weaken or replace the full plan.
 - [x] Gemini round-level observation is intentionally not shipped in v1; it
       remains optional P1 and did not block either P0 provider.
 
-### v1.1 user-functional corrections
+### M5 - release qualification track
 
-- [x] Quota renders every valid Provider window without a fixed weekly label.
-- [x] Codex desktop 0.144.2, CLI 0.144.4, and CLI 0.144.5 remain regression
-      fixtures while future versions are accepted only when the same bounded
-      numeric schema validates.
-- [x] A Claude cache created after an unavailable snapshot refreshes
-      immediately instead of waiting for the normal five-minute poll.
-- [x] Provider conversation title is the main title; the bounded current
-      question is plain second-line content and the third line is model-only.
-- [x] Claude official/custom/AI and Codex local thread titles are resolved with
-      bounded reads, explicit provenance, prompt fallback, and no transcript
-      content or path in the browser snapshot.
-- [x] Provider title and current task remain separate, and an older Claude AI
-      title cannot overwrite a newer official/custom title.
-- [x] Agent rows expose factual total-turn time plus current phase.
+M5 is a parallel release gate. Later functional milestones can be implemented
+without making the final v1 release complete.
+
+- [x] Local metrics and JSON export match the plan definitions.
+- [x] Oversize/deep JSON, host/origin/CSRF, socket permissions, and redaction
+      tests pass.
+- [x] Default logs contain no raw hook payload; diagnostic capture is explicit,
+      redacted, bounded, and expires.
+- [x] Hook non-blocking p95 is below 50ms; event-to-UI p95 below 300ms.
+- [x] Idle runtime CPU is below 0.5%; short Runtime/browser resource gates are
+      within budget.
+- [ ] Runtime RSS remains below 80MB throughout a continuous 48-hour soak on
+      the exact frozen release candidate.
+- [x] Every pass-through path leaves the Provider interface usable.
+
+### M6 - live sessions and Attention linkage
+
 - [x] The main list keeps active, attention-bearing, and last-30-minute
       sessions only.
-- [x] Selecting an attention item selects, pins, highlights, and reveals its
-      corresponding Agent session.
-- [x] Provider-handled approvals resolve attention and task waiting state.
+- [x] Attention-bearing sessions remain visible regardless of age.
+- [x] Selecting an attention item selects, pins, highlights, focuses, and
+      reveals its corresponding Agent session.
+- [x] Agent rows expose factual thinking/tool/waiting/completed/failed/idle
+      activity without inventing unavailable tool detail.
+- [x] Timer ticks update text without rebuilding the full task row.
+- [x] Claude and Codex use locally served image marks throughout the UI.
+
+### M7 - dynamic quota and truthful timing
+
+- [x] Quota renders every valid Provider window without a fixed weekly label.
+- [x] Codex fixture families remain regression evidence while future versions
+      are accepted only when the same bounded numeric schema validates.
+- [x] Last valid quota values remain visible with their real capture time;
+      stale age never fabricates freshness or percentage.
+- [x] A Claude cache created after an unavailable snapshot refreshes
+      immediately instead of waiting for the normal poll.
+- [x] Existing Claude status-line output is preserved by explicit wrapper mode
+      and restored exactly on uninstall.
+- [x] Agent rows show factual total-turn time plus current-phase time.
+
+### M8 - desktop compatibility and truthful control
+
+- [x] Claude.app and ChatGPT/Codex.app can satisfy Provider discovery without a
+      global same-name CLI.
+- [x] Codex trust remains a user-controlled `/hooks` review and is never
+      written or bypassed by Flow Agent.
+- [x] Provider-handled progress/resolution removes matching stale Attention and
+      task waiting state only when a reliable signal exists.
 - [x] Attention supports safe ignore/dismiss and a visible exit transition.
-- [x] Jump labels and actions distinguish exact Codex thread, matching
+- [x] Jump labels/actions distinguish exact conversation, matching
       Terminal/iTerm, application-only, and unsupported environments.
-- [x] A running session and its turn start survive Runtime restart; private
-      jump locators never appear in the browser snapshot.
-- [x] Claude and Codex use locally served image marks in onboarding, attention,
-      and session rows; third-party asset attribution is included.
+- [x] Running presentation and turn start survive Runtime restart; old reply
+      channels do not, and private jump locators never enter browser snapshots.
+- [x] Token/usage fields appear only when supplied by a real structured source.
 
 ### M9 - Provider title consistency
 
@@ -186,20 +214,35 @@ not weaken or replace the full plan.
 - [x] Exact candidate is installed locally and accepted by the user on
       2026-07-17 before any commit or GitHub push.
 
-### M5 - release evidence
+### M13 - Provider-owned approval-state coordination
 
-- [x] Local metrics and JSON export match the plan definitions.
-- [x] Oversize/deep JSON, host/origin/CSRF, socket permissions, and redaction
-      tests pass.
-- [x] Default logs contain no raw hook payload; diagnostic capture is explicit,
-      redacted, bounded, and expires.
-- [x] Hook non-blocking p95 is below 50ms; event-to-UI p95 below 300ms.
-- [x] Idle runtime CPU is below 0.5%; browser tab memory below 150MB.
-- [ ] Runtime RSS remains below 80MB throughout a continuous 48-hour soak.
-- [x] Every pass-through path leaves the provider terminal usable.
+- [x] Codex auto-review/guardian ownership avoids a competing Flow Agent
+      blocking waiter.
+- [x] Native `PreToolUse(request_permissions)` creates an observation-only
+      waiting item with no replyable request ID.
+- [x] Matching Provider lifecycle or managed Thread status resolves native
+      waiting neutrally without claiming approve, deny, or execution.
+- [x] Incidental running/tool activity cannot overwrite an explicit native
+      waiting state.
+- [x] Managed `waitingOnApproval` and Hook waiting deduplicate by Session.
+- [x] Provider resolution clears notifications, stale Attention, task `等你`,
+      and any competing unsent waiter transactionally.
+- [x] Native approval UI exposes only original-Agent handling, snooze, and
+      ignore; Flow-controlled approval retains allow/deny/pass-through.
+- [x] Five-round native lifecycle replay, 153-test workspace suite,
+      zero-warning Clippy, format, release build, two-minute resource gate, and
+      isolated browser QA pass.
+- [x] Candidate committed and pushed as `311306d` at the user's explicit
+      direction.
+- [ ] Real Claude/Codex Provider manual acceptance is recorded after reproducing
+      both native waiting and native resolution on the installed candidate.
 
 ## Publishing rule
 
-Each milestone is implemented test-first. Only a fully passing milestone gets a
-milestone commit and GitHub push. Failed or incomplete milestones remain local
-and are never represented as complete in documentation, tags, or releases.
+Each milestone is implemented test-first. A test-candidate branch push requires
+its automated/local gates and explicit user authorization. A milestone is not
+marked accepted until its required manual evidence also passes. Failed or
+incomplete gates remain visible and are never represented as complete in
+documentation, tags, or releases. Merging to `main`, changing the default
+branch, versioning, tagging, and publishing a release require separate user
+approval.

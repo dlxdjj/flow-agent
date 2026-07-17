@@ -1,9 +1,11 @@
 # M13 Provider state coordination verification
 
-Status: the latest native-request correction, five-round process replay, full
-workspace gates, release build, exact two-minute resource gate, isolated
-browser QA, and exact-tree local installation pass. Real Provider user
-acceptance remains pending. The change has not been committed or pushed.
+Status: implementation, five-round process replay, full workspace gates,
+release build, exact two-minute resource gate, isolated browser QA, and
+exact-tree local installation pass. The candidate was committed and pushed as
+`311306d` at the user's explicit direction. Real Provider user acceptance
+remains pending, so M13 is not yet marked manually accepted and does not make
+v1 a final release.
 
 ## Problem reproduced
 
@@ -112,9 +114,11 @@ approved, denied, or executed.
 
 ## Release boundary
 
-- Do not commit or push this milestone until the installed local candidate
-  reproduces both directions against real Provider sessions and the user
-  explicitly accepts it.
+- The test-candidate commit and branch push have already occurred by explicit
+  user direction. Do not mark M13 manually accepted, merge it into a release,
+  tag it, or use it to declare v1 complete until the installed candidate
+  reproduces native waiting and native resolution against real Provider
+  sessions and the user records the result.
 - Flow Agent does not infer the content or outcome of a native-only approval.
   It reports where the decision must be made and follows the Provider's
   authoritative waiting state.

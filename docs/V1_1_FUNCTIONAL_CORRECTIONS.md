@@ -1,8 +1,10 @@
 # v1.1 functional-correction verification
 
-Status: M6-M9 were previously completed and pushed. M10-M12 implementation,
-full gates, exact-candidate installation, and local user acceptance are now
-complete. The user authorized commit and GitHub push on 2026-07-17.
+Status: M6-M9 and M10-M12 were completed, accepted, committed, and pushed.
+M13 implementation and automated/local gates also passed and were pushed as a
+test candidate at the user's explicit direction, but its final real-Provider
+manual acceptance remains pending. The 48-hour final release soak is separate
+and still incomplete.
 
 ## User contract
 
@@ -38,6 +40,9 @@ The main product surface must obey these visible rules:
     answered in Attention; secrets remain memory-only.
 14. Restart recovery distinguishes managed/controllable, external/observing,
     waiting-for-event, lost-control, and ended without restoring old waiters.
+15. Provider-native approval and Flow-controlled approval are separate:
+    native-only waiting has no allow/deny controls, follows explicit Provider
+    resolution, and never fabricates the outcome.
 
 ## Reference decisions
 
@@ -101,6 +106,19 @@ Adopted lessons:
 - Runtime restart restores SQLite session presentation and reconnects saved
   managed Threads, but every old permission/question waiter expires first.
   A fresh Provider request is required before the UI becomes actionable again.
+
+### M13 Provider-state boundary
+
+- Codex auto-review/guardian ownership cannot create a competing Flow Agent
+  reply waiter.
+- Native `request_permissions` and managed `waitingOnApproval` produce an
+  observation-only item without a replyable request ID.
+- Only an explicit matching Provider lifecycle/status transition clears the
+  native wait. Ordinary tool/running updates cannot overwrite it.
+- Native UI offers original-Agent handling, snooze, and ignore only. It does
+  not claim approve, deny, or execution.
+- The M13 exact evidence and still-pending manual acceptance are recorded in
+  `M13_PROVIDER_STATE_COORDINATION.md`.
 
 ### UI linkage and activity
 
@@ -176,4 +194,5 @@ The resource report from this exact candidate tree is:
 
 ## Remaining long-run release evidence
 
+- record M13's real-Provider waiting/resolution manual acceptance;
 - keep the final 48-hour release soak unchecked until it actually passes.

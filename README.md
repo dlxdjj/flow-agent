@@ -13,9 +13,11 @@ Local-first attention surface for coding agents.
 Third-party asset attribution is recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The repository is an M5 release candidate under strict v1 verification. It
-provides the fail-open Hook
-bridge, persistent single-instance Runtime, authenticated localhost control
+The `agent/v1-full` branch contains functional implementation through **M13**;
+see the [current status](docs/STATUS.md) for the exact milestone, acceptance,
+branch, and release state. It remains a v1 test candidate because the separate
+48-hour Runtime stability gate has not passed. The branch provides the
+fail-open Hook bridge, persistent single-instance Runtime, authenticated localhost control
 panel, fixed three-module web UI, configurable safe task fields and detail
 drawer, direct Claude question forms, an explicit version-gated Codex
 app-server Connector with Thread recovery, safe Claude/Codex installer, first-run
@@ -93,6 +95,12 @@ Terminal/iTerm session, application only, or unsupported. Local export contains
 the sanitized SQLite tables; destructive clear requires the exact confirmation
 `DELETE` and preserves Hook integration and backups.
 
+Approval UI is capability-specific. A request with a live Flow Agent reply
+channel can be allowed, denied, or passed through. A Provider-native approval
+observed through `request_permissions` or managed Thread status is shown only
+as an original-interface request: Flow Agent synchronizes waiting/resolved
+state and never invents allow/deny controls or an approval outcome.
+
 Aggregate metrics never leave the machine automatically. `export-metrics`
 creates a separate metrics-only JSON file containing daily counters and their
 definitions, without sessions, events, attention items, commands, projects, or
@@ -111,6 +119,8 @@ flow-agent diagnostics clear
 
 ## v1 plan
 
+- [Current development and release status](docs/STATUS.md)
+- [Development changelog](CHANGELOG.md)
 - [Full v1.1 implementation plan](docs/WIDGET_V1_PLAN.md)
 - [Executable milestone acceptance](docs/V1_ACCEPTANCE.md)
 - [Open Vibe Island / CodeIsland reference decisions](docs/REFERENCE_REVIEW.md)
@@ -120,6 +130,12 @@ flow-agent diagnostics clear
 - [M3 verification record](docs/M3_VERIFICATION.md)
 - [M4 verification record](docs/M4_VERIFICATION.md)
 - [M5 verification record](docs/M5_VERIFICATION.md)
+- [M6 verification record](docs/M6_VERIFICATION.md)
+- [M7 verification record](docs/M7_VERIFICATION.md)
+- [M8 verification record](docs/M8_VERIFICATION.md)
+- [M9 verification record](docs/M9_VERIFICATION.md)
+- [M10-M12 verification record](docs/M10_M12_VERIFICATION.md)
+- [M13 Provider-state verification record](docs/M13_PROVIDER_STATE_COORDINATION.md)
 - [v1.1 functional-correction record](docs/V1_1_FUNCTIONAL_CORRECTIONS.md)
 
 ## Local quality gate
@@ -133,7 +149,8 @@ cargo build --workspace --release --offline
 ./scripts/m5-resource-check.sh target/release/flow-agent
 ```
 
-The common suite covers the provider path, SQLite Runtime, waiter, spool,
+The common suite currently covers 153 passing tests plus two explicit/manual
+tests ignored by default. It covers the provider path, SQLite Runtime, waiter, spool,
 single-instance, restart, duplicate-request, authenticated API, UI contract,
 safe install/uninstall, tri-state repair, onboarding, trust inspection, factual
 task progress, quota degradation, settings/data management, and half-close
@@ -141,9 +158,11 @@ behavior. The E2E suites verify provider
 directives, widget control, pass-through, silent fail-open behavior when the
 Runtime is absent, and the post-install real-event verification boundary.
 
-M5 is not complete until the browser render/memory measurement and a continuous
-48-hour soak pass on the exact frozen release candidate. Until then this branch
-must not be represented as a finished v1 release.
+The short browser/resource measurements pass, but M5 release qualification is
+not complete until a continuous 48-hour Runtime RSS soak passes on the exact
+frozen release candidate. M13's real-Provider manual acceptance is also still
+pending. Until both are recorded, this branch must not be represented as a
+finished v1 release.
 
 ## Privacy
 

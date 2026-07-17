@@ -1,8 +1,8 @@
 # Flow Agent Widget v1 开发计划书（施工版）
 
-版本：v1.1（M0 实证修订版）· 2026-07-15
-用途：本文档是 v1 的完整施工基线；M0 已通过，其 fixtures、能力矩阵、`REFERENCE_REVIEW.md`、`V1_ACCEPTANCE.md` 和本文共同构成实现与验收依据。
-修订说明：原草案统一 60 秒批准时限经真实 Provider 探针和 Open Vibe Island / CodeIsland 生产经验复核后废止，改为 Claude 24 小时、Codex 1 小时；Runtime 缺失、连接失败、socket EOF 和主动 pass-through 仍立即交还原终端。其余参考审查决策见 `REFERENCE_REVIEW.md`。
+版本：v1.1（M13 状态同步修订版）· 2026-07-17
+用途：本文档是 v1 的完整施工基线；功能实现已推进到 M13，当前事实状态见 `STATUS.md`，逐项验收见 `V1_ACCEPTANCE.md` 和各里程碑验证记录。
+修订说明：原草案统一 60 秒批准时限经真实 Provider 探针和 Open Vibe Island / CodeIsland 生产经验复核后废止，改为 Claude 24 小时、Codex 1 小时；Runtime 缺失、连接失败、socket EOF 和主动 pass-through 仍立即交还原界面。M6-M13 的功能修订已补入 §19；M5 的 48 小时稳定性门禁仍未完成，因此不得宣称 v1 正式发布。其余参考审查决策见 `REFERENCE_REVIEW.md`。
 上游文档：`AGENT_PRODUCT_PLAN.md`（产品总纲）、`SURVEY_INSIGHTS_UX_PLAN.md`（需求依据）、`COMPETITOR_ANALYSIS.md`（竞品与技术参考）。
 交互基准：`bento-touch.html`（仅作为视觉 token 与手势参考；能力、模块和数据真实性冲突时以本文为准）。
 
@@ -51,8 +51,8 @@
 | 项 | 内容 |
 |---|---|
 | 模块 | **待处理（Hero）、Agent 任务、额度** —— 仅三个 |
-| Provider | Claude Code CLI/Desktop 本机会话（P0，Hook 细粒度）、Codex CLI/Desktop 本机会话（P0，Hook + 批准应答）、Gemini CLI（P1，仅轮级只读） |
-| 接入模式 | **External Hook Control Mode**：Agent 仍由用户在原 CLI 或桌面客户端启动；Runtime 旁路观察事件，并在 `PermissionRequest` 阶段临时接管单次批准链路。存在受支持桌面 App 时不得强制安装全局 CLI |
+| Provider | Claude Code CLI/Desktop 本机会话（P0）、Codex CLI/Desktop 本机会话（P0）、Gemini CLI（P1，仅轮级只读）；P0 的具体控制能力按每次事件的真实 reply channel 判定 |
+| 接入模式 | **External Hook Control Mode**：Agent 仍由用户在原 CLI 或桌面客户端启动；Runtime 旁路观察事件，只在拥有官方 reply channel 时临时接管单次批准/问题链路。原生界面独占的批准只同步状态。存在受支持桌面 App 时不得强制安装全局 CLI |
 | 直接控制 | 仅 `approve / deny / pass_through_to_terminal`；每个 Session 按实际 capability 显示，不按 Provider 名称硬编码 |
 | 故障回退 | Runtime 不可用或 socket 断开时立即交还；正常等待达到 Provider 专属时限（Claude 24h / Codex 1h）时，Hook 无决定退出，Provider 恢复原生终端批准流程 |
 | 本地动作 | 跳回终端（Runtime 执行 AppleScript/开终端）；完成确认（本地归档） |
@@ -61,11 +61,11 @@
 
 ### 1.4 明确不做（v1 拒绝清单）
 
-Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12；它们不扩大 Hook-only 会话的能力。
+Coach、多 Agent 接力、决策记忆的语义匹配（仅做同类命令计数）、自动授权规则、灵动岛/三分栏视图、云端/账号/遥测、移动端、历史回放页、Gemini 批准应答、interrupt/steer/任意消息注入。v1.1 已把 Claude 官方问题 Hook、显式 Codex app-server Connector、Thread 恢复和 requestUserInput 纳入 M10-M12，并在 M13 加入 Provider 原生批准状态同步；这些能力不扩大 Hook-only 会话的所有权。Codex app-server 的 command/file/permissions 三类直接批准保留为拟议 M14，当前未实现。
 
 ### 1.5 能力边界（必须在 UI 中诚实呈现）
 
-External Hook Control Mode 不等于 Managed Mode：它只控制官方 `PermissionRequest` Hook 暴露的**一次授权**，不拥有 Agent 会话本身。Session 投影必须携带 capability，而不是由前端按 Provider 猜测：
+External Hook Control Mode 不等于 Managed Mode：它不拥有 Agent 会话本身。可直接回复的能力只来自当前事件的官方 reply channel：Hook `PermissionRequest`、Claude AskUserQuestion/Elicitation，或显式 managed Codex 的 `requestUserInput`。Provider 原生批准只观察 waiting/resolved。Session 与 Attention 投影必须携带 capability，而不是由前端按 Provider 猜测：
 
 ```json
 {
@@ -73,7 +73,9 @@ External Hook Control Mode 不等于 Managed Mode：它只控制官方 `Permissi
   "approveViaHook": true,
   "denyViaHook": true,
   "passThroughToTerminal": true,
-  "reply": false,
+  "answerQuestion": false,
+  "observeNativeApproval": true,
+  "controlMode": "external_hook",
   "interrupt": false,
   "steer": false
 }
@@ -131,6 +133,14 @@ Provider 触发 PermissionRequest
 → Runtime 崩溃、socket EOF、instanceId 改变或 Provider 专属时限到期
 → [A] 不重连、不写决定，立即退出 → Provider 原生流程接管
 → 旧 attention 标记 expired；绝不继续显示为可操作卡片
+
+分支 D · Provider 原生批准（无 Flow Agent reply channel）：
+→ Hook `PreToolUse(request_permissions)` 或 managed Thread
+  `waitingOnApproval` 明确表明原界面正在等待
+→ [B] 创建无 requestId 的 observation-only native_approval，session 标记原界面等你
+→ [C] 只显示「去 Agent 处理 / 待会提醒 / 忽略」，禁止显示允许/拒绝
+→ 仅在匹配 `PostToolUse`、Thread 状态清除或其他可靠终态到达后中性消退
+→ 不推断用户批准、拒绝或动作已经执行
 ```
 
 **依据与约束**：官方 Hook 支持在 `PermissionRequest` 返回 allow/deny；无决定退出时继续 Provider 原生批准流程。Open Vibe Island / CodeIsland 证明了外部 UI + socket 中继的可行性。v1.1 已逐项审查两者的生产故障经验，但输出字段和兼容性仍以当前官方文档及 M0 针对当前 Provider 版本采集的 fixtures 为准，不照抄过期示例或实现代码。
@@ -371,6 +381,8 @@ idle → thinking(UserPromptSubmit/BeforeAgent)
 thinking → tool_running(PreToolUse) → thinking(PostToolUse)
 thinking|tool_running → awaiting_approval(PermissionRequest, approval_owner=widget)
 awaiting_approval → awaiting_approval(pass_through, approval_owner=terminal)
+thinking|tool_running → awaiting_approval(native request_permissions / waitingOnApproval,
+                                          approval_owner=terminal, no requestId)
 awaiting_approval → thinking(决定发送后收到下一条运行事件)
 任意 → response_finished(Stop/AfterAgent) → idle
 任意 → failed(StopFailure)
@@ -383,19 +395,23 @@ PreCompact → compacting（短暂态，下一事件覆盖）
 - 迟到事件不得把 `response_finished/failed` 拉回运行态；新 `UserPromptSubmit` 才开新轮；
 - 未知 `hook_event_name` 不丢弃：记 events 表 type=`unknown`，Agent 任务模块的该 Provider 行显示"⚠ 事件不识别（可能版本不兼容）"；
 - allow/deny 写入 stdout 只产生 `decision_sent`，不能直接把 Session 拉回 thinking；必须等待下一条 Provider 事件作为继续证据；
-- pass-through 后 Session 仍为 `awaiting_approval`，但 `approval_owner=terminal`，UI 显示“原终端等你”；
+- pass-through 或原生批准后 Session 仍为 `awaiting_approval`，但 `approval_owner=terminal`，UI 显示“原界面等你”；
+- native approval 没有 requestId，不允许 allow/deny；Notification/普通 tool running 不能覆盖明确 waiting，只有匹配的 Provider lifecycle/status transition 才中性清除；
 - Runtime 启动时找不到活动 waiter 的 approval 一律 expired，禁止恢复成 open；
-- 会话 30 分钟无事件且无挂起批准 → 标记 `idle`（不是删除；进程探测 v2 再做）；
-- `SessionEnd` 缺失是常态（kill）：靠上一条超时规则降级。
+- 会话 30 分钟无事件且无挂起批准 → 从主列表过滤但保留本地历史；
+- `SessionEnd` 缺失时结合捕获的父进程/App/TTY 存活、下一条 Hook 和超时规则，投影为观察中、等待新事件、失去控制、结束或空闲。
 
 ### 7.2 AttentionItem 生成规则
 
 | 触发 | kind | 去重键 | 备注 |
 |---|---|---|---|
 | PermissionRequest | approval | requestId | 不依赖 Provider 的 tool_use_id；完整命令仅在 waiter 内存中 |
+| Provider native approval | native_approval | session+turn+native-source | 无 requestId，只观察；与 live Hook approval 去重 |
+| Claude AskUserQuestion / Elicitation | question | requestId | 官方 reply channel；secret 只在 DOM/请求/内存/一次回复中 |
+| Managed Codex requestUserInput | question | server request id | 只有显式 attach 且 capability 成功时可回答 |
 | StopFailure | error | session+turn+error | detail=error 首行（脱敏） |
 | Stop 且本轮有 PostToolUse(写类工具) | completion | session+turn+completion | "干完了，等你确认" |
-| Notification(claude, 显式 question 类型字段) | question | session+notification_id | **仅当 payload 有结构化类型字段**；不做文案关键词猜测；卡片只有「跳过去」 |
+| Notification(claude, 显式 question 类型字段) | question_notice | session+notification_id | **仅当 payload 有结构化类型字段**；不做文案关键词猜测；无 reply channel 时只跳转 |
 
 批准生命周期：
 
@@ -407,6 +423,9 @@ open → committing → decision_sent → resolved
 ```
 
 `decision_sent` 后 30 秒仍无后续事件时，卡片显示“决定已发送，但尚未观察到 Agent 继续”，不得伪造 resolved。非 approval 事项仍支持 `snooze` 10 分钟后回 open。
+
+Native approval 生命周期独立为 `open → provider_handled/expired`。`provider_handled`
+只表示可靠 Provider 信号证明“不再等待”，不得映射成 approve、deny 或 executed。
 
 ---
 
@@ -505,7 +524,7 @@ Command 提交语义：
 3. Agent 行：Provider 图标 + 名称 + project
 4. **提示块**（灰底圆角）：只呈现事实与非权威风险提示。历史只能写“过去 N 次同类请求：批准 X / 拒绝 Y”，不得仅凭历史生成“建议批准”；high/unknown 恒为“建议转到原终端核对”
 5. **影响胶囊行**：直接渲染 risk_notes（绿 ✓ / 橙 ⏱ / 红 ⚠）
-6. approval 按钮行（低/中风险）：`批准`(主黑) `不行`(红底) `去终端处理 ›`(幽灵，执行 pass-through)；**高风险**：主按钮变为 `去终端核对`，`批准…` 降为次按钮且点击弹二次确认，**触屏不提供高风险的滑动/回车捷径**
+6. capability 按钮行：replyable approval 才显示 `批准 / 不行 / 去终端处理`；native approval 只显示 `去 Agent 处理 / 待会提醒 / 忽略`；**高风险 replyable approval** 主按钮变为 `去终端核对`，`批准…` 降为次按钮且点击弹二次确认，**触屏不提供高风险的滑动/回车捷径**
 7. 分页行：圆点分页（可点）+ `第 n/N 件` + 滑动提示
 
 ### 11.2 交互
@@ -513,8 +532,9 @@ Command 提交语义：
 - 内容区左右滑切换事项（原型手势参数沿用：位移 >70px 触发、跟手 0.6 阻尼）；
 - approve/deny 后：卡片暂时移出 open 队列 → 底部撤回条 `批准 · 3 秒后提交 [撤回]`；提交后显示“决定已发送”，直到后续事件确认；写回失败则恢复卡片；
 - `去终端处理` 无撤回期：立即 pass-through，再聚焦原终端；卡片标记 passed_through，不再允许面板批准；
+- native approval 没有 approve/deny/pass-through 命令；`忽略` 只隐藏本地展示，不向 Provider 声称处理结果，后续明确 resolution 仍更新 session；
 - error 卡按钮：由事件内容生成不了选项时只给 `跳过去` + `标记已解决`；
-- question 卡（v1）：只有 `跳过去回答` + `待会`——External Hook Control Mode 不提供任意消息注入，故不做输入框；
+- question 卡：Claude AskUserQuestion/Elicitation 和 managed Codex requestUserInput 按 schema 生成本地表单；没有官方 reply channel 的 question_notice 只有 `跳过去回答` + `待会`，绝不做任意消息注入；
 - completion 卡：`没问题，收工`（ack，无延迟期）+ `跳过去看看`。
 
 ### 11.3 新事项到达
@@ -551,7 +571,7 @@ Command 提交语义：
 - Claude/Codex 使用各自可辨识的本地图像标识，不用 `Cl` / `Co` 字母占位；
   第三方图标资产只允许来自许可兼容来源并保留 notices；
 
-- 状态标签优先级：`等你`(橙, approval_owner=widget) > `终端等你`(橙描边, approval_owner=terminal) > `在跑`(蓝) > `空闲`(灰)；多件等待显示 `等你 ×N`；
+- 状态标签优先级：`等你`(橙, Flow Agent 拥有 reply channel) > `原界面等你`(橙描边, Provider 原生批准) > `在跑`(蓝) > `空闲`(灰)；多件等待显示 `等你 ×N`；
 - 点击行为：有等待 → Hero 切到该 Agent 的事项；待处理卡的“在 Agent 任务中
   查看”反向选择对应 session，置顶、高亮并滚动到可见位置；在跑 → toast 显示
   完整活动；空闲 → 无操作。
@@ -562,7 +582,7 @@ Command 提交语义：
 |---|---|---|
 | 思考中 | UserPromptSubmit / PostToolUse 后 | `●●●波浪 正在思考… <n> 秒`（秒数=now-activity_since） |
 | 执行工具 | PreToolUse | `▌闪烁 正在运行 <命令摘要>` / 写文件类 → `正在改 <文件名>`（摘要截 40 字符） |
-| 等你 | PermissionRequest / question | widget 接管时 `等你批准 · 剩余 <t>`；pass-through 后 `原终端等你处理` |
+| 等你 | PermissionRequest / question / native approval | Flow Agent 接管时 `等你批准 · 剩余 <t>`；pass-through 后 `原界面等你处理`；native approval 只显示 `原界面请求批准 · Flow Agent 仅同步状态` |
 | 子任务 | SubagentStart 计数>0 | `⑂脉冲 派了 N 个子 Agent 并行干活` |
 | 压缩记忆 | PreCompact | `◌旋转 正在压缩记忆` |
 | 这轮完成 | Stop | 绿 ✓ + 整行闪绿 1.4s → 转 completion 或空闲 |
@@ -739,9 +759,44 @@ flow-agent/
 交付：额度采集双通道与不可用态、通知规则、数据管理；Gemini 轮级观察为 P1，不能阻塞 v1 发布。
 验收：拔掉 statusline bridge/删除或改变 rollout schema 后 UI 呈现诚实降级；无可靠数据时不展示百分比。网格引擎不在 v1 发布门槛内。
 
-**M5 · 打磨与验证埋点**
+**M5 · 打磨与验证埋点（并行发布门禁，尚未全部完成）**
 交付：§21 埋点、导出、性能达标、异常态全覆盖。
-验收：§20 性能预算全绿；连续运行 48h Runtime RSS 稳定在 <80MB；所有 pass-through 路径均能继续使用原终端。
+验收：§20 短时性能预算已通过；连续运行 48h Runtime RSS 稳定在 <80MB 仍待完成；所有 pass-through 路径均能继续使用原界面。M6-M13 完成不等于此发布门禁自动完成。
+
+**M6 · 实时任务与待处理联动**
+交付：活跃/待处理/近 30 分钟会话过滤、待处理反向定位任务卡、事实活动态、真实 Provider 图标。
+验收：老会话有待处理时不被过滤；点击待处理能置顶、高亮并滚动到对应任务；计时 tick 不重建整行；缺少细粒度事件时诚实降级。
+
+**M7 · 动态额度与事实时间**
+交付：动态额度窗口、上次有效值保留、Claude cache 即时失效、statusLine 安全 wrapper、本轮总时间与阶段时间。
+验收：不硬编码“本周”；未知 schema 不显示假额度；30 分钟后仍显示真实旧值与采样时间；已有 statusLine 原样恢复；时间与 Runtime 事实一致。
+
+**M8 · Desktop 接入与真实控制边界**
+交付：无全局 CLI 的桌面 App 发现、Provider 处理后的状态同步、安全忽略、四级跳转、重启恢复与 Token 来源约束。
+验收：桌面-only 安装/Doctor 通过；Codex 信任仍由用户执行；Provider 可靠终态清除旧 `等你`；跳转能力不夸大；重启不恢复断开的 waiter。
+
+**M9 · Provider 会话标题一致性**
+交付：Claude 官方/custom/AI 标题、Codex thread_name、标题来源优先级与限量读取、三行标题栈。
+验收：主标题与客户端标题一致；第二行直接写限长任务，第三行只写模型；新标题约 2 秒内更新；迁移不丢会话；transcript 与路径不进入浏览器。
+
+**M10 · 可配置安全展示**
+交付：简洁/详细/开发者三档、安全字段目录、任务卡字段选择、详情抽屉和设置持久化。
+验收：未知/raw/payload/full-command/transcript 字段均被服务端拒绝，刷新和 Runtime 重启后设置仍在。
+
+**M11 · Agent 问题直接回答**
+交付：Claude AskUserQuestion、Elicitation、秘密字段保护；只有明确托管的 Codex requestUserInput 才展示回答框。
+验收：答案只经过 DOM、认证请求、内存 waiter 和一次 Provider 回复；不写 SQLite、日志、诊断或导出；过期问题不能提交。
+
+**M12 · Codex Connector 与会话恢复**
+交付：显式 app-server attach、thread/list/resume、requestUserInput、五级恢复状态、进程存活协调。
+验收：只有真实 resume 后显示可控制；External Hook 只显示观察能力；Runtime 重启重新连接 managed Thread，但全部旧 waiter 先失效。
+
+**M13 · Provider 原生批准状态协同（自动门禁已过，真实 Provider 复验待完成）**
+交付：auto-review ownership、Codex request_permissions 生命周期、managed waitingOnApproval、原生/Flow 可回复批准去重、通知与任务状态同步。
+验收：原生请求没有 requestId 和允许/拒绝按钮；明确 waiting 信号不被普通 running 覆盖；明确 resolution 后中性消退；不推断批准/拒绝/执行。五轮进程回放、153 测试、Clippy、格式、release、2 分钟资源和隔离浏览器 QA 已通过；真实 Provider 最终复验仍待记录。
+
+**M14 · Codex managed approvals（候选，未实现）**
+拟议范围：version-gated `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval`、availableDecisions、响应与 `serverRequest/resolved` 对账。只有显式 attach 且能力握手成功的 Thread 才能显示直接审批；不得承诺控制任意独立 Codex Desktop 会话。
 
 ---
 
@@ -781,6 +836,8 @@ flow-agent/
 | Provider 升级改 Hook schema | 合约测试 + 未知事件可见化（§7）+ fixtures 按版本归档 |
 | Codex 信任流程流失用户 | Onboarding 显式引导 + doctor 可检测"已装未信任" |
 | Hook 接管导致原终端暂时不显示批准框 | 明示接管；提供“去终端处理”；Claude 24h / Codex 1h hard deadline 自动 pass-through |
+| Provider 原界面已有批准框，但 Flow 误显示可审批 | native approval 无 requestId，UI capability 门禁，只显示原界面处理/提醒/忽略；明确 resolution 后中性消退 |
+| auto-review 与 Flow waiter 竞争 | 识别 Provider approval owner；Provider-owned 路径不创建阻塞 waiter；同 Session Hook/native 卡去重 |
 | Runtime 在批准等待中崩溃 | socket EOF → Hook 无决定退出；旧卡 expired；不尝试跨进程恢复 waiter |
 | 多 Hook 决策冲突 | stdout 只记 decision_sent；以后续 Provider 事件确认；任何 deny 不被伪装成成功 |
 | 风险规则误判 | 明确为非权威提示；测试/构建默认 medium；不改变 Provider 安全策略 |
@@ -788,6 +845,7 @@ flow-agent/
 | osascript 权限被拒 | 跳回降级为复制路径提示 |
 | 用户配置文件被其他工具并发修改 | 安装器文件锁 + 校验后写 + 失败回滚备份 |
 | SQLite 损坏 | 启动 integrity_check，失败则归档旧库重建；活动 Hook 因 Runtime 断开立即 pass-through |
+| Codex app-server approval schema/version 不兼容 | M13 只观察 native waiting；M14 三类 managed approval 必须经过显式能力握手、版本门禁和 fixture 后才能显示控制按钮 |
 
 ---
 

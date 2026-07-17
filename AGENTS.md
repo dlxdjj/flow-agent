@@ -1,9 +1,12 @@
 # Flow Agent repository guidance
 
-`docs/V1_ACCEPTANCE.md` is the executable delivery contract for v1. Work through
-M0-M5 in order. A milestone may be committed and pushed only after its listed
-checks pass and its verification note is updated with the exact commands and
-results.
+`docs/V1_ACCEPTANCE.md` is the executable delivery contract for v1 and
+`docs/STATUS.md` is the current short status. Functional work is recorded
+through M13. M5 remains a parallel final-release qualification track because
+its continuous 48-hour soak is still incomplete. A test-candidate commit/push
+requires the listed automated/local gates and explicit user authorization;
+manual acceptance, merge to `main`, version/tag, and release publication are
+separate decisions.
 
 Product invariants:
 
@@ -15,6 +18,12 @@ Product invariants:
 - Codex direct question answers require an explicitly attached, version-gated
   app-server Connector. Hook-only Codex sessions remain observe/approval-only
   and must never be shown as managed or directly answerable.
+- Provider-native approval is not the same as a request-keyed Flow Agent reply
+  channel. Native `request_permissions` / `waitingOnApproval` is observation
+  only: no request ID, no allow/deny controls, neutral resolution, and no
+  inference that the user approved, denied, or executed the action.
+- A live native waiting state survives incidental running/tool updates and
+  clears only on a matching explicit Provider lifecycle/status transition.
 - Allow, deny, and pass-through are the only v1 approval outcomes.
 - Permission hooks use provider-aligned hard deadlines owned by the hook
   process: Claude 24 hours and Codex 1 hour. Tests inject short budgets.
@@ -44,4 +53,5 @@ cargo build --workspace --release --offline
 ```
 
 Run milestone-specific integration, security, and performance checks in
-addition to this common gate.
+addition to this common gate. Documentation-only changes must still pass link,
+format, stale-status, and `git diff --check` validation before commit.
